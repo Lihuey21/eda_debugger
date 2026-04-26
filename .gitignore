@@ -1,0 +1,38 @@
+# Python virtual environments
+.venv/
+venv/
+AI_Agents/.venv/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ADK local runtime/session files
+.adk/
+**/.adk/
+session.db
+**/session.db
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Logs / outputs
+*.log
+logs/
+reports/
+outputs/
+
+# Frontend later
+node_modules/
+dist/
+build/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
