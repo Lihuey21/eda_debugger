@@ -4,7 +4,7 @@ from .tools import analyze_session_handoff
 
 root_agent = LlmAgent(
     name="script_analyzer_agent",
-    model=LiteLlm(model="openai/gpt-4o-mini", temperature=0.0),
+    model=LiteLlm(model="openai/gpt-4.1-nano", temperature=0.0),
     instruction="""
 You are the Script Analyzer Agent for the EDA Debugging Pipeline.
 

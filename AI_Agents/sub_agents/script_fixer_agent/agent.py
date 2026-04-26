@@ -4,7 +4,7 @@ from .tools import attempt_tcl_patch
 
 root_agent = LlmAgent(
     name="script_fixer_agent",
-    model=LiteLlm(model="openai/gpt-4o-mini", temperature=0.0),
+    model=LiteLlm(model="openai/gpt-4.1-mini", temperature=0.0),
     instruction="""
 You are the Script Fixer Agent for an LLM+RAG EDA Tcl debugger.
 

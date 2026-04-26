@@ -4,7 +4,7 @@ from .tools import diagnose_analysis_handoff
 
 root_agent = LlmAgent(
     name="error_diagnosis_agent",
-    model=LiteLlm(model="openai/gpt-4o-mini", temperature=0.0),
+    model=LiteLlm(model="openai/gpt-4.1-mini", temperature=0.0),
     instruction="""
 You are the Diagnosis Agent in the EDA Tcl debugging pipeline.
 

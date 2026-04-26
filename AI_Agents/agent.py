@@ -4,7 +4,7 @@ from .sub_agents.eda_debug_pipeline.agent import root_agent as eda_debug_pipelin
 
 root_agent = LlmAgent(
     name="eda_orchestrator",
-    model=LiteLlm(model="openai/gpt-4o-mini"),
+    model=LiteLlm(model="openai/gpt-4.1-nano", temperature=0.0),
     instruction="""
 You are the ONLY user-facing manager for the Agentic EDA Script Debugger.
 
