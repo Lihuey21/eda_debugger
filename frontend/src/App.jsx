@@ -35,6 +35,8 @@ const statusStyle = {
   "Manual Fix Required": "status-orange",
   "Partial Fix Applied": "status-blue",
   "No Fix Needed": "status-gray",
+  backend_test: "status-blue",
+  error: "status-orange",
   Ready: "status-gray",
   Running: "status-blue",
 };
@@ -46,6 +48,10 @@ function App() {
   const [currentStatus, setCurrentStatus] = useState("Ready");
   const [detectedCodes, setDetectedCodes] = useState([]);
   const [showAdvancedTrace, setShowAdvancedTrace] = useState(false);
+  const [trace, setTrace] = useState({
+    backend: "waiting",
+    adk: "waiting",
+  });
 
   function handleFilesSelected(event) {
     const newFiles = Array.from(event.target.files || []);
@@ -72,7 +78,7 @@ function App() {
     event.target.value = "";
   }
 
-  function handleSend() {
+  async function handleSend() {
     const trimmed = input.trim();
 
     if (!trimmed && attachments.length === 0) return;
@@ -95,56 +101,78 @@ function App() {
 
     setInput("");
     setCurrentStatus("Running");
+    setTrace({
+      backend: "sending request",
+      adk: "waiting",
+    });
 
-    // MOCK RESPONSE ONLY.
-    // Later this will be replaced with fetch() to your FastAPI + Google ADK backend.
-    setTimeout(() => {
+    try {
+      const apiBaseUrl = import.meta.env.VITE_API_BASE_URL;
+
+      if (!apiBaseUrl) {
+        throw new Error(
+          "Missing VITE_API_BASE_URL. Add it in Render frontend environment variables."
+        );
+      }
+
+      const formData = new FormData();
+      formData.append("message", userText);
+
+      attachments.forEach((file) => {
+        formData.append("files", file);
+      });
+
+      const response = await fetch(`${apiBaseUrl}/chat`, {
+        method: "POST",
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error(`Backend returned HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      const answer =
+        data.answer ||
+        "Backend responded, but no answer field was returned.";
+
       setMessages((prev) => [
         ...prev,
         {
           role: "assistant",
-          content: `Explanation
-
-The Genus run failed because the preserve command was applied before synthesis mapping was complete. The command should be moved after syn_map and before syn_opt.
-
-Detected error codes: TUI-214 and TUI-24.
-
-Patched Tcl Script
-
-set_db init_lib_search_path ../lib/
-set_db init_hdl_search_path ../rtl/
-read_libs slow_vdd1v0_basicCells.lib
-
-read_hdl counter.v
-elaborate counter
-
-read_sdc ../constraints/constraints_top.sdc
-
-set_db syn_generic_effort medium
-syn_generic
-syn_map
-set_db [get_cells -hierarchical *] .preserve true
-syn_opt
-
-report_timing > reports/report_timing.rpt
-puts "--- SYNTHESIS ATTEMPTED ---"
-quit
-
-Summary of Changes
-
-1. Moved the preserve command after syn_map.
-2. Preserved unrelated Tcl commands.
-3. Kept report commands unchanged.
-
-Fix Status
-
-Auto Fixed`,
+          content: answer,
         },
       ]);
 
-      setCurrentStatus("Auto Fixed");
-      setDetectedCodes(["TUI-214", "TUI-24"]);
-    }, 600);
+      setCurrentStatus(data.fix_status || "Completed");
+      setDetectedCodes(data.detected_codes || []);
+      setTrace(data.trace || { backend: "ok", adk: "unknown" });
+    } catch (error) {
+      console.error(error);
+
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: `Backend connection failed.
+
+Reason:
+${error.message}
+
+Check:
+1. Your Render backend is running.
+2. VITE_API_BASE_URL is set in the frontend Render environment variables.
+3. The frontend was redeployed after adding the environment variable.`,
+        },
+      ]);
+
+      setCurrentStatus("error");
+      setTrace({
+        backend: "failed",
+        adk: "not reached",
+      });
+    }
   }
 
   function handleKeyDown(event) {
@@ -165,6 +193,10 @@ Auto Fixed`,
     setCurrentStatus("Ready");
     setDetectedCodes([]);
     setShowAdvancedTrace(false);
+    setTrace({
+      backend: "waiting",
+      adk: "waiting",
+    });
   }
 
   return (
@@ -207,7 +239,7 @@ Auto Fixed`,
           <div>
             <h2>Agentic EDA Script Debugger</h2>
             <p>
-              Ask questions, attach Tcl/log/docs and debug Cadence Genus flows.
+              Ask questions, attach Tcl/log/docs, and debug Cadence Genus flows.
             </p>
           </div>
 
@@ -265,12 +297,14 @@ Auto Fixed`,
           <div className="composer">
             <textarea
               value={input}
-              placeholder="Ask the orchestrator a question or attach files and ask it to debug/explain..."
+              placeholder="Ask the orchestrator a question, or attach files and ask it to debug/explain..."
               onChange={(event) => setInput(event.target.value)}
               onKeyDown={handleKeyDown}
             />
 
-            <button onClick={handleSend}>Send</button>
+            <button onClick={handleSend}>
+              {currentStatus === "Running" ? "Running..." : "Send"}
+            </button>
           </div>
         </footer>
       </main>
@@ -293,18 +327,28 @@ Auto Fixed`,
         {showAdvancedTrace && (
           <section className="trace-panel">
             <div>
+              <strong>Backend API</strong>
+              <span>{trace.backend || "waiting"}</span>
+            </div>
+
+            <div>
+              <strong>Google ADK</strong>
+              <span>{trace.adk || "waiting"}</span>
+            </div>
+
+            <div>
               <strong>Analyzer Agent</strong>
-              <span>{currentStatus === "Ready" ? "Waiting" : "Completed"}</span>
+              <span>{currentStatus === "Ready" ? "Waiting" : "Pending"}</span>
             </div>
 
             <div>
               <strong>Diagnosis Agent</strong>
-              <span>{currentStatus === "Ready" ? "Waiting" : "Completed"}</span>
+              <span>{currentStatus === "Ready" ? "Waiting" : "Pending"}</span>
             </div>
 
             <div>
               <strong>Fixer Agent</strong>
-              <span>{currentStatus === "Ready" ? "Waiting" : "Completed"}</span>
+              <span>{currentStatus === "Ready" ? "Waiting" : "Pending"}</span>
             </div>
 
             <div>
