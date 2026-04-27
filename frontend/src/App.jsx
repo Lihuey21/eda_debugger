@@ -62,6 +62,33 @@ function isTemporarySessionId(sessionId) {
   return typeof sessionId === "string" && sessionId.startsWith("temp-");
 }
 
+function clearSupabaseBrowserSession() {
+  try {
+    const removeMatchingKeys = (storage) => {
+      Object.keys(storage).forEach((key) => {
+        const lowered = key.toLowerCase();
+        if (lowered.startsWith("sb-") || lowered.includes("supabase")) {
+          storage.removeItem(key);
+        }
+      });
+    };
+
+    removeMatchingKeys(window.localStorage);
+    removeMatchingKeys(window.sessionStorage);
+  } catch (error) {
+    console.warn("Could not clear Supabase browser session:", error);
+  }
+}
+
+function withTimeout(promise, timeoutMs = 3000) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      window.setTimeout(() => reject(new Error("Operation timed out")), timeoutMs)
+    ),
+  ]);
+}
+
 function LoginScreen({ onAuthReady }) {
   const [mode, setMode] = useState("login");
   const [displayName, setDisplayName] = useState("");
@@ -708,7 +735,18 @@ function App() {
       return;
     }
 
-    setSessions(data || []);
+    const normalizedSessions = (data || []).map((session) => {
+      if (session.last_fix_status === "Running") {
+        return {
+          ...session,
+          last_fix_status: "Cancelled",
+        };
+      }
+
+      return session;
+    });
+
+    setSessions(normalizedSessions);
   }
 
   function createTemporarySession(title) {
@@ -790,7 +828,7 @@ function App() {
   async function loadSessionMessages(sessionId) {
     if (!user || !sessionId) return;
 
-    if (activeAbortControllerRef.current) {
+    if (currentStatus === "Running" && activeAbortControllerRef.current) {
       cancelActiveRequest({ addMessage: false });
     }
 
@@ -831,12 +869,7 @@ function App() {
     setActiveSessionId(sessionId);
     setMessages(loadedMessages.length > 0 ? loadedMessages : initialMessages);
 
-    if (selectedSession?.last_fix_status === "Running") {
-      setCurrentStatus("Cancelled");
-      updateLocalSession(sessionId, {
-        last_fix_status: "Cancelled",
-      });
-    } else if (selectedSession?.last_fix_status) {
+    if (selectedSession?.last_fix_status) {
       setCurrentStatus(selectedSession.last_fix_status);
     } else {
       setCurrentStatus("Ready");
@@ -933,13 +966,7 @@ function App() {
     await loadSessions(currentUser.id);
   }
 
-  async function handleLogout() {
-    if (activeAbortControllerRef.current) {
-      cancelActiveRequest({ addMessage: false });
-    }
-
-    await supabase.auth.signOut();
-
+  function resetLocalUiAfterLogout() {
     setUser(null);
     setDisplayName("");
     setSessions([]);
@@ -955,6 +982,24 @@ function App() {
     setShowSettings(false);
     setPasswordRecoveryMode(false);
     setUiError("");
+  }
+
+  async function handleLogout() {
+    if (currentStatus === "Running" && activeAbortControllerRef.current) {
+      activeAbortControllerRef.current.abort();
+      activeAbortControllerRef.current = null;
+    }
+
+    resetLocalUiAfterLogout();
+    clearSupabaseBrowserSession();
+
+    try {
+      await withTimeout(supabase.auth.signOut({ scope: "local" }), 3000);
+    } catch (error) {
+      console.warn("Supabase sign out did not complete, local logout applied:", error);
+    } finally {
+      clearSupabaseBrowserSession();
+    }
   }
 
   function handleFilesSelected(event) {
@@ -1185,11 +1230,15 @@ function App() {
   }
 
   function handleNewChat() {
-    if (activeAbortControllerRef.current) {
+    const shouldCancelActiveRequest =
+      currentStatus === "Running" && Boolean(activeAbortControllerRef.current);
+
+    if (shouldCancelActiveRequest) {
+      const sessionToCancel = activeSessionId;
       cancelActiveRequest({ addMessage: false });
 
-      if (activeSessionId) {
-        updateSession(activeSessionId, {
+      if (sessionToCancel) {
+        updateSession(sessionToCancel, {
           last_fix_status: "Cancelled",
           detected_codes: [],
         });
@@ -1211,7 +1260,7 @@ function App() {
   }
 
   function handleOpenSettings() {
-    if (activeAbortControllerRef.current) {
+    if (currentStatus === "Running" && activeAbortControllerRef.current) {
       cancelActiveRequest({ addMessage: false });
     }
 
@@ -1228,7 +1277,7 @@ function App() {
   async function deleteSession(sessionId) {
     if (!user || !sessionId) return;
 
-    if (activeAbortControllerRef.current) {
+    if (currentStatus === "Running" && activeAbortControllerRef.current) {
       cancelActiveRequest({ addMessage: false });
     }
 
