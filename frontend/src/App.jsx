@@ -25,6 +25,46 @@ const statusClassMap = {
   "No Fix Needed": "status-gray",
 };
 
+function clearSupabaseBrowserState() {
+  const shouldRemoveKey = (key) => {
+    const lowerKey = key.toLowerCase();
+
+    return (
+      key.startsWith("sb-") ||
+      lowerKey.includes("supabase") ||
+      lowerKey.includes("auth-token")
+    );
+  };
+
+  Object.keys(localStorage).forEach((key) => {
+    if (shouldRemoveKey(key)) {
+      localStorage.removeItem(key);
+    }
+  });
+
+  Object.keys(sessionStorage).forEach((key) => {
+    if (shouldRemoveKey(key)) {
+      sessionStorage.removeItem(key);
+    }
+  });
+}
+
+function withTimeout(promise, timeoutMs = 1500) {
+  let timeoutId;
+
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = window.setTimeout(() => {
+      reject(new Error("Operation timed out"));
+    }, timeoutMs);
+  });
+
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timeoutId) {
+      window.clearTimeout(timeoutId);
+    }
+  });
+}
+
 function inferFixStatus(answer) {
   const text = (answer || "").toLowerCase();
 
@@ -62,33 +102,6 @@ function isTemporarySessionId(sessionId) {
   return typeof sessionId === "string" && sessionId.startsWith("temp-");
 }
 
-function clearSupabaseBrowserSession() {
-  try {
-    const removeMatchingKeys = (storage) => {
-      Object.keys(storage).forEach((key) => {
-        const lowered = key.toLowerCase();
-        if (lowered.startsWith("sb-") || lowered.includes("supabase")) {
-          storage.removeItem(key);
-        }
-      });
-    };
-
-    removeMatchingKeys(window.localStorage);
-    removeMatchingKeys(window.sessionStorage);
-  } catch (error) {
-    console.warn("Could not clear Supabase browser session:", error);
-  }
-}
-
-function withTimeout(promise, timeoutMs = 3000) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) =>
-      window.setTimeout(() => reject(new Error("Operation timed out")), timeoutMs)
-    ),
-  ]);
-}
-
 function LoginScreen({ onAuthReady }) {
   const [mode, setMode] = useState("login");
   const [displayName, setDisplayName] = useState("");
@@ -119,7 +132,7 @@ function LoginScreen({ onAuthReady }) {
 
     const cleanEmail = email.trim();
     const cleanPassword = password.trim();
-    const cleanName = displayName.trim() || cleanEmail;
+    const cleanName = displayName.trim() || cleanEmail || "EDA User";
 
     if (!cleanEmail || !cleanPassword) {
       setAuthStatus("Please enter both email and password.");
@@ -549,6 +562,7 @@ function App() {
 
   useEffect(() => {
     let mounted = true;
+    let authTimedOut = false;
     let timeoutId;
 
     async function loadAuthSession() {
@@ -556,18 +570,31 @@ function App() {
         timeoutId = window.setTimeout(() => {
           if (!mounted) return;
 
-          console.warn("Supabase auth check timed out. Continuing without blocking UI.");
+          authTimedOut = true;
+          clearSupabaseBrowserState();
+
+          setUser(null);
+          setDisplayName("");
+          setSessions([]);
+          setActiveSessionId(null);
+          setMessages(initialMessages);
           setAuthLoading(false);
+          setUiError("");
         }, 8000);
 
         const { data, error } = await supabase.auth.getSession();
 
-        if (!mounted) return;
+        if (!mounted || authTimedOut) return;
 
         if (error) {
-          console.warn("Auth session load failed:", error.message);
+          clearSupabaseBrowserState();
+
           setUser(null);
-          setUiError(`Auth session load failed: ${error.message}`);
+          setDisplayName("");
+          setSessions([]);
+          setActiveSessionId(null);
+          setMessages(initialMessages);
+          setUiError("");
           return;
         }
 
@@ -579,19 +606,22 @@ function App() {
           await loadSessions(currentUser.id);
         }
       } catch (error) {
-        if (!mounted) return;
+        if (!mounted || authTimedOut) return;
 
-        console.error("Unexpected auth loading error:", error);
+        clearSupabaseBrowserState();
+
         setUser(null);
-        setUiError(
-          `Unexpected auth loading error: ${error?.message || String(error)}`
-        );
+        setDisplayName("");
+        setSessions([]);
+        setActiveSessionId(null);
+        setMessages(initialMessages);
+        setUiError("");
       } finally {
         if (timeoutId) {
           window.clearTimeout(timeoutId);
         }
 
-        if (mounted) {
+        if (mounted && !authTimedOut) {
           setAuthLoading(false);
         }
       }
@@ -624,8 +654,14 @@ function App() {
           setMessages(initialMessages);
         }
       } catch (error) {
-        console.error("Auth state change error:", error);
-        setUiError(`Auth state change error: ${error?.message || String(error)}`);
+        clearSupabaseBrowserState();
+
+        setUser(null);
+        setDisplayName("");
+        setSessions([]);
+        setActiveSessionId(null);
+        setMessages(initialMessages);
+        setUiError("");
       } finally {
         setAuthLoading(false);
       }
@@ -715,7 +751,6 @@ function App() {
       .maybeSingle();
 
     if (error) {
-      console.warn("Load profile failed:", error.message);
       setDisplayName(fallbackEmail || "EDA User");
       return;
     }
@@ -735,18 +770,7 @@ function App() {
       return;
     }
 
-    const normalizedSessions = (data || []).map((session) => {
-      if (session.last_fix_status === "Running") {
-        return {
-          ...session,
-          last_fix_status: "Cancelled",
-        };
-      }
-
-      return session;
-    });
-
-    setSessions(normalizedSessions);
+    setSessions(data || []);
   }
 
   function createTemporarySession(title) {
@@ -828,7 +852,7 @@ function App() {
   async function loadSessionMessages(sessionId) {
     if (!user || !sessionId) return;
 
-    if (currentStatus === "Running" && activeAbortControllerRef.current) {
+    if (activeAbortControllerRef.current) {
       cancelActiveRequest({ addMessage: false });
     }
 
@@ -869,7 +893,12 @@ function App() {
     setActiveSessionId(sessionId);
     setMessages(loadedMessages.length > 0 ? loadedMessages : initialMessages);
 
-    if (selectedSession?.last_fix_status) {
+    if (selectedSession?.last_fix_status === "Running") {
+      setCurrentStatus("Cancelled");
+      updateLocalSession(sessionId, {
+        last_fix_status: "Cancelled",
+      });
+    } else if (selectedSession?.last_fix_status) {
       setCurrentStatus(selectedSession.last_fix_status);
     } else {
       setCurrentStatus("Ready");
@@ -966,7 +995,13 @@ function App() {
     await loadSessions(currentUser.id);
   }
 
-  function resetLocalUiAfterLogout() {
+  async function handleLogout() {
+    if (activeAbortControllerRef.current) {
+      cancelActiveRequest({ addMessage: false });
+    }
+
+    clearSupabaseBrowserState();
+
     setUser(null);
     setDisplayName("");
     setSessions([]);
@@ -982,23 +1017,14 @@ function App() {
     setShowSettings(false);
     setPasswordRecoveryMode(false);
     setUiError("");
-  }
-
-  async function handleLogout() {
-    if (currentStatus === "Running" && activeAbortControllerRef.current) {
-      activeAbortControllerRef.current.abort();
-      activeAbortControllerRef.current = null;
-    }
-
-    resetLocalUiAfterLogout();
-    clearSupabaseBrowserSession();
+    setAuthLoading(false);
 
     try {
-      await withTimeout(supabase.auth.signOut({ scope: "local" }), 3000);
-    } catch (error) {
-      console.warn("Supabase sign out did not complete, local logout applied:", error);
+      await withTimeout(supabase.auth.signOut({ scope: "local" }), 1500);
+    } catch {
+      // Local logout already applied. Do not block the UI.
     } finally {
-      clearSupabaseBrowserSession();
+      clearSupabaseBrowserState();
     }
   }
 
@@ -1230,15 +1256,11 @@ function App() {
   }
 
   function handleNewChat() {
-    const shouldCancelActiveRequest =
-      currentStatus === "Running" && Boolean(activeAbortControllerRef.current);
-
-    if (shouldCancelActiveRequest) {
-      const sessionToCancel = activeSessionId;
+    if (activeAbortControllerRef.current && currentStatus === "Running") {
       cancelActiveRequest({ addMessage: false });
 
-      if (sessionToCancel) {
-        updateSession(sessionToCancel, {
+      if (activeSessionId) {
+        updateSession(activeSessionId, {
           last_fix_status: "Cancelled",
           detected_codes: [],
         });
@@ -1260,7 +1282,7 @@ function App() {
   }
 
   function handleOpenSettings() {
-    if (currentStatus === "Running" && activeAbortControllerRef.current) {
+    if (activeAbortControllerRef.current && currentStatus === "Running") {
       cancelActiveRequest({ addMessage: false });
     }
 
@@ -1277,7 +1299,7 @@ function App() {
   async function deleteSession(sessionId) {
     if (!user || !sessionId) return;
 
-    if (currentStatus === "Running" && activeAbortControllerRef.current) {
+    if (activeAbortControllerRef.current && currentStatus === "Running") {
       cancelActiveRequest({ addMessage: false });
     }
 
@@ -1370,7 +1392,7 @@ function App() {
         <div className="sidebar-footer">
           <div className="user-card">
             <div className="avatar">
-              {(displayName || user.email || "E").slice(0, 1).toUpperCase()}
+              {(displayName || user.email || "U").slice(0, 1).toUpperCase()}
             </div>
 
             <div>
@@ -1425,7 +1447,9 @@ function App() {
               >
                 <div className="message-avatar">
                   {message.role === "user"
-                    ? (displayName || user.email || "U").slice(0, 1).toUpperCase()
+                    ? (displayName || user.email || "U")
+                        .slice(0, 1)
+                        .toUpperCase()
                     : "A"}
                 </div>
 

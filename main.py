@@ -20,7 +20,7 @@ app = FastAPI(title="EDA Debugger Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later after final frontend URL is confirmed
+    allow_origins=["*"],  
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -153,7 +153,6 @@ def is_probably_tcl(filename: str, text: str) -> bool:
     name = (filename or "").lower()
     lowered = (text or "").lower()
 
-    # Logs often echo Tcl commands, so explicit log filenames must win.
     if is_log_filename(name):
         return False
 
@@ -184,7 +183,6 @@ def is_probably_log(filename: str, text: str) -> bool:
     if is_log_filename(name):
         return True
 
-    # Avoid classifying Tcl scripts as logs just because comments mention errors.
     if is_probably_tcl(filename, text):
         return False
 
