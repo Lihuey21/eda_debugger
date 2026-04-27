@@ -529,12 +529,8 @@ function App() {
         timeoutId = window.setTimeout(() => {
           if (!mounted) return;
 
-          console.warn("Supabase auth check timed out. Showing login screen.");
+          console.warn("Supabase auth check timed out. Continuing without blocking UI.");
           setAuthLoading(false);
-          setUser(null);
-          setUiError(
-            "Supabase authentication check timed out. Check your .env keys and internet connection."
-          );
         }, 8000);
 
         const { data, error } = await supabase.auth.getSession();
