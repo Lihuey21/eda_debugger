@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import "./App.css";
 import { supabase } from "./supabaseClient";
 
@@ -12,6 +12,28 @@ const initialMessages = [
       "Hi, I am your Agentic EDA Script Debugger. You can ask me EDA questions, or attach Tcl scripts and Genus logs for debugging.",
   },
 ];
+
+const LOCAL_GREETING_REPLY =
+  "Hello! Upload both a Tcl script and the matching Genus/EDA log for a full debugging run, or ask me a Cadence/EDA question.";
+
+function isSimpleGreeting(message) {
+  const normalized = String(message || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^\w\s]/g, "")
+    .replace(/\s+/g, " ");
+
+  return [
+    "hi",
+    "hello",
+    "hey",
+    "yo",
+    "sup",
+    "good morning",
+    "good afternoon",
+    "good evening",
+  ].includes(normalized);
+}
 
 const statusClassMap = {
   Ready: "status-gray",
@@ -28,7 +50,6 @@ const statusClassMap = {
 function clearSupabaseBrowserState() {
   const shouldRemoveKey = (key) => {
     const lowerKey = key.toLowerCase();
-
     return (
       key.startsWith("sb-") ||
       lowerKey.includes("supabase") ||
@@ -37,19 +58,15 @@ function clearSupabaseBrowserState() {
   };
 
   Object.keys(localStorage).forEach((key) => {
-    if (shouldRemoveKey(key)) {
-      localStorage.removeItem(key);
-    }
+    if (shouldRemoveKey(key)) localStorage.removeItem(key);
   });
 
   Object.keys(sessionStorage).forEach((key) => {
-    if (shouldRemoveKey(key)) {
-      sessionStorage.removeItem(key);
-    }
+    if (shouldRemoveKey(key)) sessionStorage.removeItem(key);
   });
 }
 
-function withTimeout(promise, timeoutMs = 1500) {
+function withTimeout(promise, timeoutMs = 2000) {
   let timeoutId;
 
   const timeoutPromise = new Promise((_, reject) => {
@@ -59,14 +76,120 @@ function withTimeout(promise, timeoutMs = 1500) {
   });
 
   return Promise.race([promise, timeoutPromise]).finally(() => {
-    if (timeoutId) {
-      window.clearTimeout(timeoutId);
-    }
+    if (timeoutId) window.clearTimeout(timeoutId);
   });
 }
 
+function fireAndForget(promise, label = "background task") {
+  Promise.resolve(promise).catch((error) => {
+    console.warn(`${label} failed:`, error?.message || error);
+  });
+}
+
+function isTemporarySessionId(sessionId) {
+  return typeof sessionId === "string" && sessionId.startsWith("temp-");
+}
+
+function messageCacheKey(userId, sessionId) {
+  if (!userId || !sessionId) return null;
+  return `eda-debugger-messages:${userId}:${sessionId}`;
+}
+
+function loadCachedMessages(userId, sessionId) {
+  const key = messageCacheKey(userId, sessionId);
+  if (!key) return [];
+
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return [];
+
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed.filter(
+      (message) =>
+        message &&
+        (message.role === "user" || message.role === "assistant") &&
+        typeof message.content === "string"
+    );
+  } catch {
+    return [];
+  }
+}
+
+function saveCachedMessages(userId, sessionId, nextMessages) {
+  const key = messageCacheKey(userId, sessionId);
+  if (!key || !Array.isArray(nextMessages)) return;
+
+  try {
+    localStorage.setItem(
+      key,
+      JSON.stringify(
+        nextMessages.map((message) => ({
+          role: message.role,
+          content: String(message.content || ""),
+          files: Array.isArray(message.files) ? message.files : [],
+        }))
+      )
+    );
+  } catch (error) {
+    console.warn("Message cache save failed:", error?.message || error);
+  }
+}
+
+function migrateCachedMessages(userId, oldSessionId, newSessionId) {
+  if (!userId || !oldSessionId || !newSessionId || oldSessionId === newSessionId) return;
+
+  const oldKey = messageCacheKey(userId, oldSessionId);
+  const newKey = messageCacheKey(userId, newSessionId);
+  if (!oldKey || !newKey) return;
+
+  try {
+    const raw = localStorage.getItem(oldKey);
+    if (!raw) return;
+    localStorage.setItem(newKey, raw);
+    localStorage.removeItem(oldKey);
+  } catch (error) {
+    console.warn("Message cache migration failed:", error?.message || error);
+  }
+}
+
+function normalizeFixStatus(rawStatus, answer = "") {
+  const normalized = String(rawStatus || "").trim().toLowerCase();
+
+  if (normalized === "partial fix applied" || normalized === "partial_fix_applied") {
+    return "Partial Fix Applied";
+  }
+
+  if (normalized === "manual fix required" || normalized === "manual_required") {
+    return "Manual Fix Required";
+  }
+
+  if (normalized === "auto fixed" || normalized === "auto_fixed") {
+    return "Auto Fixed";
+  }
+
+  if (normalized === "no fix needed" || normalized === "no_fix_needed") {
+    return "No Fix Needed";
+  }
+
+  if (normalized === "cancelled" || normalized === "canceled") {
+    return "Cancelled";
+  }
+
+  if (normalized === "error" || normalized === "failed") {
+    return "Error";
+  }
+
+  if (normalized === "completed" || normalized === "complete") {
+    return "Completed";
+  }
+
+  return inferFixStatus(answer);
+}
+
 function inferFixStatus(answer) {
-  const text = (answer || "").toLowerCase();
+  const text = String(answer || "").toLowerCase();
 
   if (text.includes("partial fix applied")) return "Partial Fix Applied";
   if (text.includes("manual fix required")) return "Manual Fix Required";
@@ -77,29 +200,33 @@ function inferFixStatus(answer) {
   return "Completed";
 }
 
-function extractDetectedCodes(answer) {
-  const matches = (answer || "").match(/\b[A-Z]{2,6}-\d+\b/g);
-  return Array.from(new Set(matches || []));
+function normalizeLoadedSession(session) {
+  if (!session) return session;
+
+  if (session.last_fix_status === "Running") {
+    return {
+      ...session,
+      last_fix_status: "Cancelled",
+    };
+  }
+
+  return session;
 }
 
-function makeSessionTitle(files, message, status) {
+function makeSessionTitle(files, message, fallback = "Debug Session") {
   const fileNames = files.map((file) => file.name).join(", ");
 
   if (fileNames) {
-    return fileNames.length > 48 ? `${fileNames.slice(0, 48)}...` : fileNames;
+    return fileNames.length > 52 ? `${fileNames.slice(0, 52)}...` : fileNames;
   }
 
-  const trimmed = message.trim();
+  const trimmed = String(message || "").trim();
 
   if (trimmed) {
-    return trimmed.length > 48 ? `${trimmed.slice(0, 48)}...` : trimmed;
+    return trimmed.length > 52 ? `${trimmed.slice(0, 52)}...` : trimmed;
   }
 
-  return status || "debug_session";
-}
-
-function isTemporarySessionId(sessionId) {
-  return typeof sessionId === "string" && sessionId.startsWith("temp-");
+  return fallback;
 }
 
 function LoginScreen({ onAuthReady }) {
@@ -107,24 +234,21 @@ function LoginScreen({ onAuthReady }) {
   const [displayName, setDisplayName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-
   const [authStatus, setAuthStatus] = useState("");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isResetting, setIsResetting] = useState(false);
 
-  async function upsertProfile(user, name) {
-    if (!user?.id) return;
+  async function upsertProfile(currentUser, name) {
+    if (!currentUser?.id) return;
 
-    const finalName = name?.trim() || user.email || "EDA User";
+    const finalName = name?.trim() || currentUser.email || "EDA User";
 
     const { error } = await supabase.from("profiles").upsert({
-      id: user.id,
+      id: currentUser.id,
       display_name: finalName,
     });
 
-    if (error) {
-      console.warn("Profile upsert failed:", error.message);
-    }
+    if (error) console.warn("Profile upsert failed:", error.message);
   }
 
   async function handleSubmit(event) {
@@ -147,25 +271,17 @@ function LoginScreen({ onAuthReady }) {
         const { data, error } = await supabase.auth.signUp({
           email: cleanEmail,
           password: cleanPassword,
-          options: {
-            data: {
-              display_name: cleanName,
-            },
-          },
+          options: { data: { display_name: cleanName } },
         });
 
         if (error) throw error;
 
-        if (data.user) {
-          await upsertProfile(data.user, cleanName);
-        }
+        if (data.user) await upsertProfile(data.user, cleanName);
 
         if (data.session?.user) {
           onAuthReady(data.session.user);
         } else {
-          setAuthStatus(
-            "Account created. Check your email if confirmation is enabled."
-          );
+          setAuthStatus("Account created. Check your email if confirmation is enabled.");
         }
       } else {
         const { data, error } = await supabase.auth.signInWithPassword({
@@ -176,7 +292,12 @@ function LoginScreen({ onAuthReady }) {
         if (error) throw error;
 
         if (data.user) {
-          await upsertProfile(data.user, cleanName);
+          // Do not overwrite an existing saved display name during normal login.
+          // Only update the profile here if the user explicitly typed a display name.
+          if (displayName.trim()) {
+            await upsertProfile(data.user, cleanName);
+          }
+
           onAuthReady(data.user);
         }
       }
@@ -199,17 +320,13 @@ function LoginScreen({ onAuthReady }) {
     setAuthStatus("");
 
     try {
-      const redirectTo = window.location.origin;
-
       const { error } = await supabase.auth.resetPasswordForEmail(cleanEmail, {
-        redirectTo,
+        redirectTo: window.location.origin,
       });
 
       if (error) throw error;
 
-      setAuthStatus(
-        "Password reset email sent. Check your inbox and follow the link."
-      );
+      setAuthStatus("Password reset email sent. Check your inbox and follow the link.");
     } catch (error) {
       setAuthStatus(error.message || "Password reset failed.");
     } finally {
@@ -275,11 +392,7 @@ function LoginScreen({ onAuthReady }) {
         </label>
 
         <button type="submit" disabled={isSubmitting}>
-          {isSubmitting
-            ? "Please wait..."
-            : mode === "login"
-            ? "Log In"
-            : "Create Account"}
+          {isSubmitting ? "Please wait..." : mode === "login" ? "Log In" : "Create Account"}
         </button>
 
         {mode === "login" && (
@@ -294,92 +407,58 @@ function LoginScreen({ onAuthReady }) {
         )}
 
         {authStatus && <p className="auth-status">{authStatus}</p>}
-
-        <small>
-          Supabase Auth is used for prototype login and database-backed chat
-          history.
-        </small>
       </form>
     </div>
   );
 }
 
-function TraceStatus({ label, status, spinning = false }) {
-  return (
-    <div className="trace-row">
-      <strong>{label}</strong>
-
-      <span className="trace-status">
-        {spinning && <span className="agent-spinner" />}
-        {status}
-      </span>
-    </div>
-  );
-}
-
 function TextBlock({ text }) {
-  const lines = text.split("\n");
-
   return (
     <div className="text-block">
-      {lines.map((line, index) => {
-        const trimmed = line.trim();
+      {String(text || "")
+        .split("\n")
+        .map((line, index) => {
+          const trimmed = line.trim();
 
-        if (!trimmed) {
-          return <div key={index} className="line-spacer" />;
-        }
+          if (!trimmed) return <div key={index} className="line-spacer" />;
 
-        const boldMatch = trimmed.match(/^\*\*(.+)\*\*$/);
+          const boldMatch = trimmed.match(/^\*\*(.+)\*\*$/);
 
-        if (boldMatch) {
-          return (
-            <div key={index} className="markdown-heading">
-              {boldMatch[1]}
-            </div>
-          );
-        }
+          if (boldMatch) {
+            return (
+              <div key={index} className="markdown-heading">
+                {boldMatch[1]}
+              </div>
+            );
+          }
 
-        return <div key={index}>{line}</div>;
-      })}
+          return <div key={index}>{line}</div>;
+        })}
     </div>
   );
 }
 
 function MessageContent({ content }) {
-  const text = content || "";
+  const text = String(content || "");
   const parts = [];
   const regex = /```(\w+)?\n?([\s\S]*?)```/g;
-
   let lastIndex = 0;
   let match;
 
   while ((match = regex.exec(text)) !== null) {
     if (match.index > lastIndex) {
-      parts.push({
-        type: "text",
-        value: text.slice(lastIndex, match.index),
-      });
+      parts.push({ type: "text", value: text.slice(lastIndex, match.index) });
     }
 
-    parts.push({
-      type: "code",
-      language: match[1] || "",
-      value: match[2] || "",
-    });
-
+    parts.push({ type: "code", value: match[2] || "" });
     lastIndex = regex.lastIndex;
   }
 
   if (lastIndex < text.length) {
-    parts.push({
-      type: "text",
-      value: text.slice(lastIndex),
-    });
+    parts.push({ type: "text", value: text.slice(lastIndex) });
   }
 
-  if (parts.length === 0) {
-    return <TextBlock text={text} />;
-  }
+  if (parts.length === 0) return <TextBlock text={text} />;
 
   return (
     <div className="rendered-message">
@@ -426,17 +505,37 @@ function SettingsPanel({
     setStatus("");
 
     try {
-      const { error } = await supabase.from("profiles").upsert({
-        id: user.id,
-        display_name: cleanName,
+      // Update the visible UI immediately so the Settings page never looks frozen.
+      onProfileUpdated(cleanName);
+
+      const profileWrite = supabase.from("profiles").upsert(
+        {
+          id: user.id,
+          display_name: cleanName,
+        },
+        { onConflict: "id" }
+      );
+
+      const metadataWrite = supabase.auth.updateUser({
+        data: { display_name: cleanName },
       });
 
-      if (error) throw error;
+      const [profileResult, metadataResult] = await withTimeout(
+        Promise.all([profileWrite, metadataWrite]),
+        5000
+      );
 
-      onProfileUpdated(cleanName);
+      if (profileResult?.error) throw profileResult.error;
+      if (metadataResult?.error) throw metadataResult.error;
+
       setStatus("Profile name updated.");
     } catch (error) {
-      setStatus(error.message || "Failed to update profile.");
+      // Keep the local UI update, but show the real persistence problem.
+      setStatus(
+        `Name updated on this screen, but database save did not complete: ${
+          error.message || "Unknown error"
+        }`
+      );
     } finally {
       setIsSavingName(false);
     }
@@ -461,18 +560,25 @@ function SettingsPanel({
     setStatus("");
 
     try {
-      const { error } = await supabase.auth.updateUser({
-        password: cleanPassword,
-      });
+      const sessionResult = await withTimeout(supabase.auth.getSession(), 12000);
+      const activeSession = sessionResult?.data?.session;
 
+      if (sessionResult?.error) throw sessionResult.error;
+      if (!activeSession) {
+        throw new Error(
+          "No active Supabase auth session found. Please log out, log in again, then change the password."
+        );
+      }
+
+      const { error } = await withTimeout(
+        supabase.auth.updateUser({ password: cleanPassword }),
+        20000
+      );
       if (error) throw error;
 
       setNewPassword("");
       setStatus("Password updated successfully.");
-
-      if (onPasswordUpdated) {
-        onPasswordUpdated();
-      }
+      onPasswordUpdated?.();
     } catch (error) {
       setStatus(error.message || "Failed to update password.");
     } finally {
@@ -488,15 +594,14 @@ function SettingsPanel({
           <p>Manage profile and password for this prototype account.</p>
         </div>
 
-        <button className="close-settings-btn" onClick={onClose}>
+        <button type="button" className="close-settings-btn" onClick={onClose}>
           Close
         </button>
       </div>
 
       {recoveryMode && (
         <p className="settings-status">
-          Password recovery mode is active. Enter a new password below to finish
-          resetting your account password.
+          Password recovery mode is active. Enter a new password below.
         </p>
       )}
 
@@ -536,8 +641,22 @@ function SettingsPanel({
   );
 }
 
+
+function TraceStatus({ label, status, spinning = false }) {
+  return (
+    <div className="trace-row">
+      <strong>{label}</strong>
+      <span className="trace-status">
+        {spinning && <span className="agent-spinner" />}
+        {status}
+      </span>
+    </div>
+  );
+}
+
 function App() {
   const activeAbortControllerRef = useRef(null);
+  const activeSessionIdRef = useRef(null);
 
   const [authLoading, setAuthLoading] = useState(true);
   const [user, setUser] = useState(null);
@@ -551,137 +670,16 @@ function App() {
   const [attachments, setAttachments] = useState([]);
 
   const [currentStatus, setCurrentStatus] = useState("Ready");
-  const [detectedCodes, setDetectedCodes] = useState([]);
   const [showAdvancedTrace, setShowAdvancedTrace] = useState(false);
   const [lastTrace, setLastTrace] = useState(null);
   const [runningStage, setRunningStage] = useState("idle");
-
   const [showSettings, setShowSettings] = useState(false);
   const [passwordRecoveryMode, setPasswordRecoveryMode] = useState(false);
   const [uiError, setUiError] = useState("");
 
   useEffect(() => {
-    let mounted = true;
-    let authTimedOut = false;
-    let timeoutId;
-
-    async function loadAuthSession() {
-      try {
-        timeoutId = window.setTimeout(() => {
-          if (!mounted) return;
-
-          authTimedOut = true;
-          clearSupabaseBrowserState();
-
-          setUser(null);
-          setDisplayName("");
-          setSessions([]);
-          setActiveSessionId(null);
-          setMessages(initialMessages);
-          setAuthLoading(false);
-          setUiError("");
-        }, 8000);
-
-        const { data, error } = await supabase.auth.getSession();
-
-        if (!mounted || authTimedOut) return;
-
-        if (error) {
-          clearSupabaseBrowserState();
-
-          setUser(null);
-          setDisplayName("");
-          setSessions([]);
-          setActiveSessionId(null);
-          setMessages(initialMessages);
-          setUiError("");
-          return;
-        }
-
-        const currentUser = data?.session?.user || null;
-        setUser(currentUser);
-
-        if (currentUser) {
-          await loadProfile(currentUser.id, currentUser.email);
-          await loadSessions(currentUser.id);
-        }
-      } catch (error) {
-        if (!mounted || authTimedOut) return;
-
-        clearSupabaseBrowserState();
-
-        setUser(null);
-        setDisplayName("");
-        setSessions([]);
-        setActiveSessionId(null);
-        setMessages(initialMessages);
-        setUiError("");
-      } finally {
-        if (timeoutId) {
-          window.clearTimeout(timeoutId);
-        }
-
-        if (mounted && !authTimedOut) {
-          setAuthLoading(false);
-        }
-      }
-    }
-
-    loadAuthSession();
-
-    const { data } = supabase.auth.onAuthStateChange(async (_event, session) => {
-      try {
-        const currentUser = session?.user || null;
-
-        setUser(currentUser);
-
-        if (_event === "PASSWORD_RECOVERY") {
-          setPasswordRecoveryMode(true);
-          setShowSettings(true);
-          setShowAdvancedTrace(false);
-          setUiError(
-            "Password recovery mode active. Enter your new password in Settings."
-          );
-        }
-
-        if (currentUser) {
-          await loadProfile(currentUser.id, currentUser.email);
-          await loadSessions(currentUser.id);
-        } else {
-          setDisplayName("");
-          setSessions([]);
-          setActiveSessionId(null);
-          setMessages(initialMessages);
-        }
-      } catch (error) {
-        clearSupabaseBrowserState();
-
-        setUser(null);
-        setDisplayName("");
-        setSessions([]);
-        setActiveSessionId(null);
-        setMessages(initialMessages);
-        setUiError("");
-      } finally {
-        setAuthLoading(false);
-      }
-    });
-
-    return () => {
-      mounted = false;
-
-      if (timeoutId) {
-        window.clearTimeout(timeoutId);
-      }
-
-      if (activeAbortControllerRef.current) {
-        activeAbortControllerRef.current.abort();
-        activeAbortControllerRef.current = null;
-      }
-
-      data?.subscription?.unsubscribe();
-    };
-  }, []);
+    activeSessionIdRef.current = activeSessionId;
+  }, [activeSessionId]);
 
   useEffect(() => {
     if (currentStatus !== "Running") {
@@ -691,26 +689,114 @@ function App() {
 
     setRunningStage("backend");
 
-    const agentTimer = setTimeout(() => {
+    const agentTimer = window.setTimeout(() => {
       setRunningStage("agentic");
     }, 900);
 
-    return () => {
-      clearTimeout(agentTimer);
-    };
+    return () => window.clearTimeout(agentTimer);
   }, [currentStatus]);
 
-  const activeSession = sessions.find((item) => item.id === activeSessionId);
+  useEffect(() => {
+    let mounted = true;
+    let timedOut = false;
+    let timeoutId;
+
+    async function loadAuthSession() {
+      try {
+        timeoutId = window.setTimeout(() => {
+          if (!mounted) return;
+          timedOut = true;
+          clearSupabaseBrowserState();
+          setUser(null);
+          setDisplayName("");
+          setSessions([]);
+          setActiveSessionId(null);
+          activeSessionIdRef.current = null;
+          setMessages(initialMessages);
+          setAuthLoading(false);
+        }, 8000);
+
+        const { data, error } = await supabase.auth.getSession();
+        if (!mounted || timedOut) return;
+
+        if (error) throw error;
+
+        const currentUser = data?.session?.user || null;
+        setUser(currentUser);
+
+        if (currentUser) {
+          await loadProfile(currentUser.id, currentUser.email, currentUser);
+          await loadSessions(currentUser.id);
+        }
+      } catch {
+        if (!mounted || timedOut) return;
+        clearSupabaseBrowserState();
+        setUser(null);
+        setDisplayName("");
+        setSessions([]);
+        setActiveSessionId(null);
+        activeSessionIdRef.current = null;
+        setMessages(initialMessages);
+      } finally {
+        if (timeoutId) window.clearTimeout(timeoutId);
+        if (mounted && !timedOut) setAuthLoading(false);
+      }
+    }
+
+    loadAuthSession();
+
+    const { data } = supabase.auth.onAuthStateChange((event, session) => {
+      const currentUser = session?.user || null;
+      setUser(currentUser);
+
+      if (event === "PASSWORD_RECOVERY") {
+        setPasswordRecoveryMode(true);
+        setShowSettings(true);
+        setUiError("Password recovery mode active. Enter your new password in Settings.");
+      }
+
+      if (!currentUser) {
+        setDisplayName("");
+        setSessions([]);
+        setActiveSessionId(null);
+        activeSessionIdRef.current = null;
+        setMessages(initialMessages);
+        setAuthLoading(false);
+        return;
+      }
+
+      // Important: do not await Supabase queries directly inside onAuthStateChange.
+      // In development this can hold the Supabase auth storage lock and cause
+      // updateUser/password changes to time out. Defer profile/history loading.
+      window.setTimeout(async () => {
+        try {
+          await loadProfile(currentUser.id, currentUser.email, currentUser);
+          await loadSessions(currentUser.id);
+        } catch (error) {
+          console.warn("Deferred auth-state reload failed:", error?.message || error);
+        } finally {
+          if (mounted) setAuthLoading(false);
+        }
+      }, 0);
+    });
+
+    return () => {
+      mounted = false;
+      if (timeoutId) window.clearTimeout(timeoutId);
+      activeAbortControllerRef.current?.abort();
+      activeAbortControllerRef.current = null;
+      data?.subscription?.unsubscribe();
+    };
+  }, []);
+
+  const activeSession = sessions.find((session) => session.id === activeSessionId);
   const statusClass = statusClassMap[currentStatus] || "status-gray";
 
-  const traceStatus = useMemo(() => {
+  const traceStatus = (() => {
     const route = lastTrace?.route || lastTrace?.adk_trace?.app_name || "";
 
     if (currentStatus === "Ready") {
-      return {
-        backend: "waiting",
-        agentic: "waiting",
-      };
+      return { backend: "waiting", agentic: "waiting" };
     }
 
     if (currentStatus === "Running") {
@@ -724,26 +810,20 @@ function App() {
     }
 
     if (currentStatus === "Error") {
-      return {
-        backend: "error",
-        agentic: "failed or interrupted",
-      };
+      return { backend: "error", agentic: "failed or interrupted" };
     }
 
     if (currentStatus === "Cancelled") {
-      return {
-        backend: "cancelled",
-        agentic: "cancelled by user",
-      };
+      return { backend: "cancelled", agentic: "cancelled by user" };
     }
 
     return {
       backend: "ok",
       agentic: route ? `completed (${route})` : "completed",
     };
-  }, [currentStatus, runningStage, lastTrace]);
+  })();
 
-  async function loadProfile(userId, fallbackEmail) {
+  async function loadProfile(userId, fallbackEmail, currentUser = null) {
     const { data, error } = await supabase
       .from("profiles")
       .select("display_name")
@@ -755,7 +835,8 @@ function App() {
       return;
     }
 
-    setDisplayName(data?.display_name || fallbackEmail || "EDA User");
+    const metadataName = currentUser?.user_metadata?.display_name;
+    setDisplayName(data?.display_name || metadataName || fallbackEmail || "EDA User");
   }
 
   async function loadSessions(userId) {
@@ -770,12 +851,16 @@ function App() {
       return;
     }
 
-    setSessions(data || []);
+    setSessions((data || []).map(normalizeLoadedSession));
+  }
+
+  function setActiveSession(sessionId) {
+    activeSessionIdRef.current = sessionId;
+    setActiveSessionId(sessionId);
   }
 
   function createTemporarySession(title) {
     const tempId = `temp-${Date.now()}`;
-
     const tempSession = {
       id: tempId,
       user_id: user?.id || null,
@@ -788,18 +873,20 @@ function App() {
     };
 
     setSessions((prev) => [tempSession, ...prev]);
-    setActiveSessionId(tempId);
-
+    setActiveSession(tempId);
     return tempId;
   }
 
   function replaceTemporarySession(tempId, realSession) {
+    const normalizedSession = normalizeLoadedSession(realSession);
+
     setSessions((prev) => {
-      const withoutTemp = prev.filter((item) => item.id !== tempId);
-      return [realSession, ...withoutTemp];
+      const withoutTemp = prev.filter((session) => session.id !== tempId);
+      return [normalizedSession, ...withoutTemp];
     });
 
-    setActiveSessionId(realSession.id);
+    migrateCachedMessages(user?.id, tempId, normalizedSession.id);
+    setActiveSession(normalizedSession.id);
   }
 
   function updateLocalSession(sessionId, updates) {
@@ -808,115 +895,14 @@ function App() {
     setSessions((prev) =>
       prev.map((session) =>
         session.id === sessionId
-          ? {
-              ...session,
-              ...updates,
-              updated_at: new Date().toISOString(),
-            }
+          ? { ...session, ...updates, updated_at: new Date().toISOString() }
           : session
       )
     );
   }
 
-  function cancelActiveRequest({ addMessage = false } = {}) {
-    if (activeAbortControllerRef.current) {
-      activeAbortControllerRef.current.abort();
-      activeAbortControllerRef.current = null;
-    }
-
-    setCurrentStatus("Cancelled");
-    setRunningStage("idle");
-    setLastTrace({
-      backend: "cancelled",
-      message: "Request cancelled by user.",
-    });
-
-    if (activeSessionId) {
-      updateLocalSession(activeSessionId, {
-        last_fix_status: "Cancelled",
-        detected_codes: [],
-      });
-    }
-
-    if (addMessage) {
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: "Request cancelled by user.",
-        },
-      ]);
-    }
-  }
-
-  async function loadSessionMessages(sessionId) {
-    if (!user || !sessionId) return;
-
-    if (activeAbortControllerRef.current) {
-      cancelActiveRequest({ addMessage: false });
-    }
-
-    setUiError("");
-    setShowSettings(false);
-    setPasswordRecoveryMode(false);
-    setShowAdvancedTrace(false);
-
-    const selectedSession = sessions.find((item) => item.id === sessionId);
-
-    if (selectedSession?.is_temporary || isTemporarySessionId(sessionId)) {
-      setActiveSessionId(sessionId);
-      setCurrentStatus(selectedSession?.last_fix_status || "Running");
-      setDetectedCodes(selectedSession?.detected_codes || []);
-      setLastTrace(null);
-      setRunningStage("idle");
-      return;
-    }
-
-    const { data, error } = await supabase
-      .from("chat_messages")
-      .select("*")
-      .eq("session_id", sessionId)
-      .eq("user_id", user.id)
-      .order("created_at", { ascending: true });
-
-    if (error) {
-      setUiError(`Failed to load messages: ${error.message}`);
-      return;
-    }
-
-    const loadedMessages = (data || []).map((item) => ({
-      role: item.role,
-      content: item.content,
-      files: item.file_names || [],
-    }));
-
-    setActiveSessionId(sessionId);
-    setMessages(loadedMessages.length > 0 ? loadedMessages : initialMessages);
-
-    if (selectedSession?.last_fix_status === "Running") {
-      setCurrentStatus("Cancelled");
-      updateLocalSession(sessionId, {
-        last_fix_status: "Cancelled",
-      });
-    } else if (selectedSession?.last_fix_status) {
-      setCurrentStatus(selectedSession.last_fix_status);
-    } else {
-      setCurrentStatus("Ready");
-    }
-
-    setDetectedCodes(selectedSession?.detected_codes || []);
-    setLastTrace(null);
-    setRunningStage("idle");
-  }
-
-  async function createSession({
-    title = "New Debug Session",
-    status = null,
-    codes = [],
-  } = {}) {
-    if (!user) {
-      throw new Error("User is not logged in.");
-    }
+  async function createSession({ title, status = "Running" }) {
+    if (!user) throw new Error("User is not logged in.");
 
     const { data, error } = await supabase
       .from("chat_sessions")
@@ -924,15 +910,12 @@ function App() {
         user_id: user.id,
         title,
         last_fix_status: status,
-        detected_codes: codes,
+        detected_codes: [],
       })
       .select()
       .single();
 
-    if (error) {
-      throw new Error(`Failed to create session: ${error.message}`);
-    }
-
+    if (error) throw new Error(`Failed to create session: ${error.message}`);
     return data;
   }
 
@@ -941,9 +924,7 @@ function App() {
 
     updateLocalSession(sessionId, updates);
 
-    if (isTemporarySessionId(sessionId)) {
-      return;
-    }
+    if (isTemporarySessionId(sessionId)) return;
 
     const { data, error } = await supabase
       .from("chat_sessions")
@@ -959,19 +940,12 @@ function App() {
     }
 
     setSessions((prev) => {
-      const filtered = prev.filter((item) => item.id !== sessionId);
-      return [data, ...filtered];
+      const filtered = prev.filter((session) => session.id !== sessionId);
+      return [normalizeLoadedSession(data), ...filtered];
     });
   }
 
-  async function saveMessage({
-    sessionId,
-    role,
-    content,
-    fileNames = [],
-    fixStatus = null,
-    codes = [],
-  }) {
+  async function saveMessage({ sessionId, role, content, fileNames = [], fixStatus = null }) {
     if (!user || !sessionId || isTemporarySessionId(sessionId)) return;
 
     const { error } = await supabase.from("chat_messages").insert({
@@ -981,36 +955,32 @@ function App() {
       content,
       file_names: fileNames,
       fix_status: fixStatus,
-      detected_codes: codes,
+      detected_codes: [],
     });
 
-    if (error) {
-      console.warn("Save message failed:", error.message);
-    }
+    if (error) console.warn("Save message failed:", error.message);
   }
 
   async function handleAuthReady(currentUser) {
     setUser(currentUser);
-    await loadProfile(currentUser.id, currentUser.email);
+    await loadProfile(currentUser.id, currentUser.email, currentUser);
     await loadSessions(currentUser.id);
   }
 
   async function handleLogout() {
-    if (activeAbortControllerRef.current) {
-      cancelActiveRequest({ addMessage: false });
-    }
+    activeAbortControllerRef.current?.abort();
+    activeAbortControllerRef.current = null;
 
     clearSupabaseBrowserState();
 
     setUser(null);
     setDisplayName("");
     setSessions([]);
-    setActiveSessionId(null);
+    setActiveSession(null);
     setMessages(initialMessages);
     setInput("");
     setAttachments([]);
     setCurrentStatus("Ready");
-    setDetectedCodes([]);
     setShowAdvancedTrace(false);
     setLastTrace(null);
     setRunningStage("idle");
@@ -1022,7 +992,7 @@ function App() {
     try {
       await withTimeout(supabase.auth.signOut({ scope: "local" }), 1500);
     } catch {
-      // Local logout already applied. Do not block the UI.
+      // Local logout already applied. Do not block UI.
     } finally {
       clearSupabaseBrowserState();
     }
@@ -1035,17 +1005,14 @@ function App() {
       const mergedFiles = [...prevFiles];
 
       newFiles.forEach((newFile) => {
-        const alreadyExists = mergedFiles.some((existingFile) => {
-          return (
+        const alreadyExists = mergedFiles.some(
+          (existingFile) =>
             existingFile.name === newFile.name &&
             existingFile.size === newFile.size &&
             existingFile.lastModified === newFile.lastModified
-          );
-        });
+        );
 
-        if (!alreadyExists) {
-          mergedFiles.push(newFile);
-        }
+        if (!alreadyExists) mergedFiles.push(newFile);
       });
 
       return mergedFiles;
@@ -1054,13 +1021,82 @@ function App() {
     event.target.value = "";
   }
 
+  async function loadSessionMessages(sessionId) {
+    if (!user || !sessionId) return;
+
+    activeAbortControllerRef.current?.abort();
+    activeAbortControllerRef.current = null;
+
+    setUiError("");
+    setShowSettings(false);
+    setPasswordRecoveryMode(false);
+    setInput("");
+    setAttachments([]);
+
+    const selectedSession = normalizeLoadedSession(
+      sessions.find((session) => session.id === sessionId)
+    );
+
+    setActiveSession(sessionId);
+    setCurrentStatus(
+      selectedSession?.last_fix_status === "Running"
+        ? "Ready"
+        : selectedSession?.last_fix_status || "Ready"
+    );
+    setLastTrace(null);
+    setRunningStage("idle");
+
+    const cachedMessages = loadCachedMessages(user.id, sessionId);
+
+    // Show cached messages immediately if they exist, but still fetch Supabase below
+    // so the clicked history item always restores the saved database version.
+    setMessages(cachedMessages.length > 0 ? cachedMessages : initialMessages);
+
+    if (selectedSession?.is_temporary || isTemporarySessionId(sessionId)) {
+      return;
+    }
+
+    // The session list is already filtered by user_id.
+    // Do not also filter chat_messages by user_id here, because older saved rows
+    // can fail to load if message.user_id is missing/mismatched even though
+    // message.session_id is correct. RLS still protects rows at the database layer.
+    const { data, error } = await supabase
+      .from("chat_messages")
+      .select("role, content, file_names, created_at")
+      .eq("session_id", sessionId)
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      setUiError(`Failed to load messages: ${error.message}`);
+      if (cachedMessages.length === 0) setMessages(initialMessages);
+      return;
+    }
+
+    const loadedMessages = (data || [])
+      .filter((item) => item && (item.role === "user" || item.role === "assistant"))
+      .map((item) => ({
+        role: item.role,
+        content: String(item.content || ""),
+        files: Array.isArray(item.file_names) ? item.file_names : [],
+      }));
+
+    if (loadedMessages.length > 0) {
+      setMessages(loadedMessages);
+      saveCachedMessages(user.id, sessionId, loadedMessages);
+      return;
+    }
+
+    if (cachedMessages.length === 0) {
+      setMessages(initialMessages);
+    }
+  }
+
   async function handleSend() {
     const trimmedMessage = input.trim();
     const filesForRequest = [...attachments];
 
-    if (!trimmedMessage && filesForRequest.length === 0) {
-      return;
-    }
+    if (currentStatus === "Running") return;
+    if (!trimmedMessage && filesForRequest.length === 0) return;
 
     if (!user) {
       setUiError("Please log in first.");
@@ -1069,16 +1105,33 @@ function App() {
 
     const finalUserMessage =
       trimmedMessage ||
-      `Please analyze the attached files: ${filesForRequest
-        .map((file) => file.name)
-        .join(", ")}.`;
+      `Please analyze the attached files: ${filesForRequest.map((file) => file.name).join(", ")}.`;
+
+    // Critical demo path: greetings must never enter ADK, Supabase writes, or the backend.
+    // This prevents the UI from getting stuck on "Running..." for a simple "hi".
+    if (filesForRequest.length === 0 && isSimpleGreeting(finalUserMessage)) {
+      const localUserMessage = { role: "user", content: finalUserMessage, files: [] };
+      const localAssistantMessage = { role: "assistant", content: LOCAL_GREETING_REPLY };
+
+      setUiError("");
+      setShowSettings(false);
+      setPasswordRecoveryMode(false);
+      setMessages((prev) => [...prev, localUserMessage, localAssistantMessage]);
+      setInput("");
+      setAttachments([]);
+      setCurrentStatus("Completed");
+      setLastTrace({
+        backend: "not_required",
+        route: "frontend_local_greeting",
+        adk: "not_required",
+        agentic: "not_required",
+      });
+      setRunningStage("idle");
+      return;
+    }
 
     const fileNames = filesForRequest.map((file) => file.name);
-    const sessionTitle = makeSessionTitle(
-      filesForRequest,
-      finalUserMessage,
-      "Running"
-    );
+    const sessionTitle = makeSessionTitle(filesForRequest, finalUserMessage);
 
     setUiError("");
     setShowSettings(false);
@@ -1090,14 +1143,7 @@ function App() {
       files: fileNames,
     };
 
-    setMessages((prev) => [...prev, userMessage]);
-    setInput("");
-    setAttachments([]);
-    setCurrentStatus("Running");
-    setDetectedCodes([]);
-    setLastTrace(null);
-
-    let sessionId = activeSessionId;
+    let sessionId = activeSessionIdRef.current;
 
     if (!sessionId) {
       sessionId = createTemporarySession(sessionTitle);
@@ -1109,33 +1155,57 @@ function App() {
       });
     }
 
+    const messagesWithUser = [...messages, userMessage];
+    setMessages(messagesWithUser);
+    saveCachedMessages(user.id, sessionId, messagesWithUser);
+    setInput("");
+    setAttachments([]);
+    setCurrentStatus("Running");
+    setLastTrace(null);
+
     const controller = new AbortController();
     activeAbortControllerRef.current = controller;
 
     try {
       if (isTemporarySessionId(sessionId)) {
-        const realSession = await createSession({
-          title: sessionTitle,
-          status: "Running",
-          codes: [],
-        });
-
-        replaceTemporarySession(sessionId, realSession);
-        sessionId = realSession.id;
+        try {
+          const realSession = await withTimeout(
+            createSession({ title: sessionTitle, status: "Running" }),
+            2500
+          );
+          const oldSessionId = sessionId;
+          replaceTemporarySession(oldSessionId, realSession);
+          sessionId = realSession.id;
+          saveCachedMessages(user.id, sessionId, messagesWithUser);
+        } catch (error) {
+          console.warn("Session creation skipped; continuing with temporary session:", error.message);
+        }
       }
 
-      await saveMessage({
-        sessionId,
-        role: "user",
-        content: finalUserMessage,
-        fileNames,
-      });
+      fireAndForget(
+        saveMessage({
+          sessionId,
+          role: "user",
+          content: finalUserMessage,
+          fileNames,
+        }),
+        "save user message"
+      );
 
-      await updateSession(sessionId, {
+      updateLocalSession(sessionId, {
         title: sessionTitle,
         last_fix_status: "Running",
         detected_codes: [],
       });
+
+      fireAndForget(
+        updateSession(sessionId, {
+          title: sessionTitle,
+          last_fix_status: "Running",
+          detected_codes: [],
+        }),
+        "update running session"
+      );
 
       const formData = new FormData();
       formData.append("message", finalUserMessage);
@@ -1144,88 +1214,105 @@ function App() {
         formData.append("files", file);
       });
 
-      const response = await fetch(`${API_BASE_URL}/chat`, {
-        method: "POST",
-        body: formData,
-        signal: controller.signal,
-      });
+      const requestTimeoutMs = filesForRequest.length > 0 ? 300000 : 60000;
+      const requestTimeoutId = window.setTimeout(() => {
+        controller.abort();
+      }, requestTimeoutMs);
 
-      if (!response.ok) {
-        throw new Error(`Backend returned HTTP ${response.status}`);
+      let response;
+
+      try {
+        response = await fetch(`${API_BASE_URL}/chat`, {
+          method: "POST",
+          body: formData,
+          signal: controller.signal,
+        });
+      } finally {
+        window.clearTimeout(requestTimeoutId);
       }
 
+      if (!response.ok) throw new Error(`Backend returned HTTP ${response.status}`);
+
       const data = await response.json();
+      const answer = data.answer || data.response || data.message || "No response returned from backend.";
+      const status = normalizeFixStatus(data.fix_status, answer);
 
-      const answer =
-        data.answer ||
-        data.response ||
-        data.message ||
-        "No response returned from backend.";
-
-      const status = inferFixStatus(answer);
-      const codes = data.detected_codes?.length
-        ? data.detected_codes
-        : extractDetectedCodes(answer);
-
-      const assistantMessage = {
-        role: "assistant",
-        content: answer,
-      };
-
-      setMessages((prev) => [...prev, assistantMessage]);
-      setCurrentStatus(status);
-      setDetectedCodes(codes);
-      setLastTrace(data.trace || null);
-
-      await saveMessage({
-        sessionId,
-        role: "assistant",
-        content: answer,
-        fixStatus: status,
-        codes,
-      });
-
-      await updateSession(sessionId, {
+      updateLocalSession(sessionId, {
         title: sessionTitle,
         last_fix_status: status,
-        detected_codes: codes,
+        detected_codes: [],
       });
+
+      if (activeSessionIdRef.current === sessionId) {
+        setMessages((prev) => {
+          const updatedMessages = [...prev, { role: "assistant", content: answer }];
+          saveCachedMessages(user.id, sessionId, updatedMessages);
+          return updatedMessages;
+        });
+        setCurrentStatus(status);
+        setLastTrace(data.trace || null);
+      }
+
+      fireAndForget(
+        updateSession(sessionId, {
+          title: sessionTitle,
+          last_fix_status: status,
+          detected_codes: [],
+        }),
+        "update completed session"
+      );
+
+      fireAndForget(
+        saveMessage({
+          sessionId,
+          role: "assistant",
+          content: answer,
+          fixStatus: status,
+        }),
+        "save assistant message"
+      );
     } catch (error) {
       const wasCancelled = error.name === "AbortError";
-
+      const finalStatus = wasCancelled ? "Cancelled" : "Error";
       const errorMessage = wasCancelled
         ? "Request cancelled by user."
         : `Backend request failed.\n\n${error.message}`;
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: errorMessage,
-        },
-      ]);
-
-      const finalStatus = wasCancelled ? "Cancelled" : "Error";
-
-      setCurrentStatus(finalStatus);
-      setRunningStage("idle");
-      setLastTrace({
-        backend: wasCancelled ? "cancelled" : "failed",
-        error: wasCancelled ? "Request cancelled by user." : error.message,
-      });
-
-      await saveMessage({
-        sessionId,
-        role: "assistant",
-        content: errorMessage,
-        fixStatus: finalStatus,
-        codes: [],
-      });
-
-      await updateSession(sessionId, {
+      updateLocalSession(sessionId, {
         last_fix_status: finalStatus,
         detected_codes: [],
       });
+
+      if (activeSessionIdRef.current === sessionId) {
+        setCurrentStatus(finalStatus);
+        setLastTrace({
+          backend: wasCancelled ? "cancelled" : "failed",
+          error: wasCancelled ? "Request cancelled by user." : error.message,
+        });
+        setMessages((prev) => {
+          const updatedMessages = [...prev, { role: "assistant", content: errorMessage }];
+          saveCachedMessages(user.id, sessionId, updatedMessages);
+          return updatedMessages;
+        });
+      }
+
+      fireAndForget(
+        updateSession(sessionId, {
+          last_fix_status: finalStatus,
+          detected_codes: [],
+        }),
+        "update failed session"
+      );
+
+      fireAndForget(
+        saveMessage({
+          sessionId,
+          role: "assistant",
+          content: errorMessage,
+          fixStatus: finalStatus,
+        }),
+        "save failure message"
+      );
     } finally {
       if (activeAbortControllerRef.current === controller) {
         activeAbortControllerRef.current = null;
@@ -1234,45 +1321,40 @@ function App() {
   }
 
   function handleCancelButton() {
-    cancelActiveRequest({ addMessage: true });
+    const sessionId = activeSessionIdRef.current;
 
-    if (activeSessionId) {
-      updateSession(activeSessionId, {
+    activeAbortControllerRef.current?.abort();
+    activeAbortControllerRef.current = null;
+
+    setCurrentStatus("Cancelled");
+    setLastTrace({ backend: "cancelled", message: "Request cancelled by user." });
+    setRunningStage("idle");
+
+    if (sessionId) {
+      updateLocalSession(sessionId, {
         last_fix_status: "Cancelled",
         detected_codes: [],
       });
+      fireAndForget(
+        updateSession(sessionId, {
+          last_fix_status: "Cancelled",
+          detected_codes: [],
+        }),
+        "update cancelled session"
+      );
     }
-  }
-
-  function handleKeyDown(event) {
-    if (event.key === "Enter" && !event.shiftKey) {
-      event.preventDefault();
-      handleSend();
-    }
-  }
-
-  function clearAttachments() {
-    setAttachments([]);
   }
 
   function handleNewChat() {
     if (activeAbortControllerRef.current && currentStatus === "Running") {
-      cancelActiveRequest({ addMessage: false });
-
-      if (activeSessionId) {
-        updateSession(activeSessionId, {
-          last_fix_status: "Cancelled",
-          detected_codes: [],
-        });
-      }
+      handleCancelButton();
     }
 
-    setActiveSessionId(null);
+    setActiveSession(null);
     setMessages(initialMessages);
     setInput("");
     setAttachments([]);
     setCurrentStatus("Ready");
-    setDetectedCodes([]);
     setShowAdvancedTrace(false);
     setLastTrace(null);
     setRunningStage("idle");
@@ -1283,7 +1365,11 @@ function App() {
 
   function handleOpenSettings() {
     if (activeAbortControllerRef.current && currentStatus === "Running") {
-      cancelActiveRequest({ addMessage: false });
+      activeAbortControllerRef.current.abort();
+      activeAbortControllerRef.current = null;
+      setCurrentStatus("Cancelled");
+      setLastTrace({ backend: "cancelled", message: "Request cancelled because Settings was opened." });
+      setRunningStage("idle");
     }
 
     setShowSettings(true);
@@ -1291,21 +1377,17 @@ function App() {
     setUiError("");
   }
 
-  function handlePasswordUpdated() {
-    setPasswordRecoveryMode(false);
-    setUiError("Password updated successfully.");
-  }
-
   async function deleteSession(sessionId) {
     if (!user || !sessionId) return;
 
-    if (activeAbortControllerRef.current && currentStatus === "Running") {
-      cancelActiveRequest({ addMessage: false });
-    }
+    activeAbortControllerRef.current?.abort();
+    activeAbortControllerRef.current = null;
 
     if (isTemporarySessionId(sessionId)) {
-      setSessions((prev) => prev.filter((item) => item.id !== sessionId));
-      handleNewChat();
+      const cacheKey = messageCacheKey(user.id, sessionId);
+      if (cacheKey) localStorage.removeItem(cacheKey);
+      setSessions((prev) => prev.filter((session) => session.id !== sessionId));
+      if (activeSessionIdRef.current === sessionId) handleNewChat();
       return;
     }
 
@@ -1320,10 +1402,20 @@ function App() {
       return;
     }
 
-    setSessions((prev) => prev.filter((item) => item.id !== sessionId));
+    const cacheKey = messageCacheKey(user.id, sessionId);
+    if (cacheKey) localStorage.removeItem(cacheKey);
 
-    if (activeSessionId === sessionId) {
+    setSessions((prev) => prev.filter((session) => session.id !== sessionId));
+
+    if (activeSessionIdRef.current === sessionId) {
       handleNewChat();
+    }
+  }
+
+  function handleKeyDown(event) {
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      handleSend();
     }
   }
 
@@ -1346,7 +1438,6 @@ function App() {
         <div>
           <div className="brand">
             <div className="brand-icon">E</div>
-
             <div>
               <h1>EDA Debugger</h1>
               <p>Google ADK Tcl Assistant</p>
@@ -1354,11 +1445,12 @@ function App() {
           </div>
 
           <nav className="nav">
-            <button className="nav-active" onClick={handleNewChat}>
+            <button type="button" className="nav-active" onClick={handleNewChat}>
               New Chat
             </button>
-
-            <button onClick={handleOpenSettings}>Settings</button>
+            <button type="button" onClick={handleOpenSettings}>
+              Settings
+            </button>
           </nav>
 
           <section className="sidebar-history">
@@ -1381,7 +1473,6 @@ function App() {
                     onClick={() => loadSessionMessages(session.id)}
                   >
                     <span>{session.title}</span>
-                    <small>{session.last_fix_status || "No status"}</small>
                   </button>
                 ))
               )}
@@ -1394,14 +1485,13 @@ function App() {
             <div className="avatar">
               {(displayName || user.email || "U").slice(0, 1).toUpperCase()}
             </div>
-
             <div>
               <p className="user-name">{displayName || user.email}</p>
               <p className="user-role">{user.email}</p>
             </div>
           </div>
 
-          <button className="logout-btn" onClick={handleLogout}>
+          <button type="button" className="logout-btn" onClick={handleLogout}>
             Log out
           </button>
         </div>
@@ -1411,11 +1501,8 @@ function App() {
         <header className="chat-header">
           <div>
             <h2>Agentic EDA Script Debugger</h2>
-            <p>
-              Ask questions, attach Tcl/log/docs, and debug Cadence Genus flows.
-            </p>
+            <p>Ask questions, attach Tcl/log/docs, and debug Cadence Genus flows.</p>
           </div>
-
           <div className="top-actions">
             <span className="kg-pill">Neo4j RAG</span>
             <span className="kg-pill">Google ADK</span>
@@ -1434,22 +1521,21 @@ function App() {
               setPasswordRecoveryMode(false);
             }}
             onProfileUpdated={(newName) => setDisplayName(newName)}
-            onPasswordUpdated={handlePasswordUpdated}
+            onPasswordUpdated={() => {
+              setPasswordRecoveryMode(false);
+              setUiError("Password updated successfully.");
+            }}
           />
         ) : (
           <section className="messages">
             {messages.map((message, index) => (
               <div
                 key={`${message.role}-${index}`}
-                className={`message-row ${
-                  message.role === "user" ? "message-user" : "message-assistant"
-                }`}
+                className={`message-row ${message.role === "user" ? "message-user" : "message-assistant"}`}
               >
                 <div className="message-avatar">
                   {message.role === "user"
-                    ? (displayName || user.email || "U")
-                        .slice(0, 1)
-                        .toUpperCase()
+                    ? (displayName || user.email || "U").slice(0, 1).toUpperCase()
                     : "A"}
                 </div>
 
@@ -1485,10 +1571,7 @@ function App() {
                     <span>No files attached</span>
                   ) : (
                     attachments.map((file) => (
-                      <span
-                        key={`${file.name}-${file.size}`}
-                        className="file-pill"
-                      >
+                      <span key={`${file.name}-${file.size}`} className="file-pill">
                         {file.name}
                       </span>
                     ))
@@ -1496,7 +1579,7 @@ function App() {
                 </div>
 
                 {attachments.length > 0 && (
-                  <button className="clear-files-btn" onClick={clearAttachments}>
+                  <button type="button" className="clear-files-btn" onClick={() => setAttachments([])}>
                     Clear
                   </button>
                 )}
@@ -1513,6 +1596,7 @@ function App() {
 
                 <div className="composer-actions">
                   <button
+                    type="button"
                     className="send-btn"
                     onClick={handleSend}
                     disabled={currentStatus === "Running"}
@@ -1521,11 +1605,7 @@ function App() {
                   </button>
 
                   {currentStatus === "Running" && (
-                    <button
-                      className="cancel-btn"
-                      type="button"
-                      onClick={handleCancelButton}
-                    >
+                    <button type="button" className="cancel-btn" onClick={handleCancelButton}>
                       Cancel
                     </button>
                   )}
@@ -1535,8 +1615,7 @@ function App() {
           )}
 
           <p className="disclaimer">
-            EDADebugger can make mistakes. Check and clarify important
-            information before applying fixes to real EDA flows.
+            EDADebugger can make mistakes. Check and clarify important informations.
           </p>
         </footer>
       </main>
@@ -1548,6 +1627,7 @@ function App() {
         </div>
 
         <button
+          type="button"
           className="trace-panel-button"
           onClick={() => setShowAdvancedTrace((value) => !value)}
         >
@@ -1567,46 +1647,8 @@ function App() {
               status={traceStatus.agentic}
               spinning={currentStatus === "Running" && runningStage === "agentic"}
             />
-
-            {detectedCodes.length > 0 && (
-              <div className="trace-row">
-                <strong>Detected Codes</strong>
-                <span>{detectedCodes.join(", ")}</span>
-              </div>
-            )}
           </section>
         )}
-
-        <div className="history-header small-header">
-          <h3>Run Summary</h3>
-        </div>
-
-        <div className="history-list">
-          {!activeSession ? (
-            <p className="empty-history">No active saved session yet.</p>
-          ) : (
-            <div className="history-item static-item">
-              <strong>{activeSession.title || "Current session"}</strong>
-
-              <p>
-                {detectedCodes.length > 0
-                  ? detectedCodes.join(", ")
-                  : "No codes detected"}
-              </p>
-
-              <span className={`mini-status ${statusClass}`}>
-                {currentStatus}
-              </span>
-
-              <button
-                className="delete-session-btn"
-                onClick={() => deleteSession(activeSession.id)}
-              >
-                Delete Session
-              </button>
-            </div>
-          )}
-        </div>
       </aside>
     </div>
   );

@@ -64,6 +64,25 @@ fixability_reason=<diagnosis_evidence.fixability_reason>
 Never leave fixability empty.
 Never leave fixability_reason empty if it exists in the diagnosis payload.
 
+RAG GROUNDING RULE:
+For auto_fixable and partial_fixable cases, diagnosis_evidence.evidence_summary.recommended_fix_strategy and diagnosis_evidence.evidence_summary.retrieved_notes are mandatory constraints.
+
+You must obey retrieved_notes exactly when it contains:
+- "MUST"
+- "NEVER"
+- "do not"
+- "move"
+- "before"
+- "after"
+
+Before calling attempt_tcl_patch, verify that patched_tcl does not violate retrieved_notes.
+
+If retrieved_notes says a command/value must never be used, that command/value must not appear in patched_tcl.
+
+If retrieved_notes says a command must be moved before/after another command, preserve the original command and only relocate it.
+
+Do not replace a command with a different value unless retrieved_notes or recommended_fix_strategy explicitly says to replace it.
+
 MANUAL_REQUIRED BEHAVIOR:
 If fixability is "manual_required":
 - You MUST write manual_response yourself before calling attempt_tcl_patch.
