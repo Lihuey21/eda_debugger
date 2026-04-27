@@ -1,14 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import "./App.css";
+import { supabase } from "./supabaseClient";
 
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8000";
-
-const STORAGE_KEYS = {
-  loggedIn: "eda_debugger_logged_in",
-  displayName: "eda_debugger_display_name",
-  history: "eda_debugger_history",
-};
 
 const initialMessages = [
   {
@@ -32,9 +27,9 @@ const statusClassMap = {
 function inferFixStatus(answer) {
   const text = (answer || "").toLowerCase();
 
-  if (text.includes("auto fixed")) return "Auto Fixed";
-  if (text.includes("manual fix required")) return "Manual Fix Required";
   if (text.includes("partial fix applied")) return "Partial Fix Applied";
+  if (text.includes("manual fix required")) return "Manual Fix Required";
+  if (text.includes("auto fixed")) return "Auto Fixed";
   if (text.includes("no fix needed")) return "No Fix Needed";
 
   return "Completed";
@@ -61,28 +56,119 @@ function makeSessionTitle(files, message, status) {
   return status || "debug_session";
 }
 
-function safeLoadHistory() {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEYS.history);
-    const parsed = JSON.parse(raw || "[]");
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
+function LoginScreen({ onAuthReady }) {
+  const [mode, setMode] = useState("login");
+  const [displayName, setDisplayName] = useState("Demo User");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+
+  const [authStatus, setAuthStatus] = useState("");
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isResetting, setIsResetting] = useState(false);
+
+  async function upsertProfile(user, name) {
+    if (!user?.id) return;
+
+    const finalName = name?.trim() || user.email || "EDA User";
+
+    const { error } = await supabase.from("profiles").upsert({
+      id: user.id,
+      display_name: finalName,
+    });
+
+    if (error) {
+      console.warn("Profile upsert failed:", error.message);
+    }
   }
-}
 
-function saveHistory(historyItems) {
-  localStorage.setItem(STORAGE_KEYS.history, JSON.stringify(historyItems));
-}
-
-function LoginScreen({ onLogin }) {
-  const [name, setName] = useState("Demo User");
-
-  function handleSubmit(event) {
+  async function handleSubmit(event) {
     event.preventDefault();
 
-    const cleanName = name.trim() || "Demo User";
-    onLogin(cleanName);
+    const cleanEmail = email.trim();
+    const cleanPassword = password.trim();
+    const cleanName = displayName.trim() || "Demo User";
+
+    if (!cleanEmail || !cleanPassword) {
+      setAuthStatus("Please enter both email and password.");
+      return;
+    }
+
+    setIsSubmitting(true);
+    setAuthStatus("");
+
+    try {
+      if (mode === "signup") {
+        const { data, error } = await supabase.auth.signUp({
+          email: cleanEmail,
+          password: cleanPassword,
+          options: {
+            data: {
+              display_name: cleanName,
+            },
+          },
+        });
+
+        if (error) throw error;
+
+        if (data.user) {
+          await upsertProfile(data.user, cleanName);
+        }
+
+        if (data.session?.user) {
+          onAuthReady(data.session.user);
+        } else {
+          setAuthStatus(
+            "Account created. Check your email if confirmation is enabled."
+          );
+        }
+      } else {
+        const { data, error } = await supabase.auth.signInWithPassword({
+          email: cleanEmail,
+          password: cleanPassword,
+        });
+
+        if (error) throw error;
+
+        if (data.user) {
+          await upsertProfile(data.user, cleanName);
+          onAuthReady(data.user);
+        }
+      }
+    } catch (error) {
+      setAuthStatus(error.message || "Authentication failed.");
+    } finally {
+      setIsSubmitting(false);
+    }
+  }
+
+  async function handleForgotPassword() {
+    const cleanEmail = email.trim();
+
+    if (!cleanEmail) {
+      setAuthStatus("Enter your email first, then click Forgot password.");
+      return;
+    }
+
+    setIsResetting(true);
+    setAuthStatus("");
+
+    try {
+      const redirectTo = window.location.origin;
+
+      const { error } = await supabase.auth.resetPasswordForEmail(cleanEmail, {
+        redirectTo,
+      });
+
+      if (error) throw error;
+
+      setAuthStatus(
+        "Password reset email sent. Check your inbox and follow the link."
+      );
+    } catch (error) {
+      setAuthStatus(error.message || "Password reset failed.");
+    } finally {
+      setIsResetting(false);
+    }
   }
 
   return (
@@ -95,20 +181,77 @@ function LoginScreen({ onLogin }) {
           <p>Agentic Tcl/log debugging prototype for Cadence Genus.</p>
         </div>
 
+        <div className="auth-tabs">
+          <button
+            type="button"
+            className={mode === "login" ? "auth-tab-active" : ""}
+            onClick={() => setMode("login")}
+          >
+            Log In
+          </button>
+
+          <button
+            type="button"
+            className={mode === "signup" ? "auth-tab-active" : ""}
+            onClick={() => setMode("signup")}
+          >
+            Sign Up
+          </button>
+        </div>
+
         <label>
           Display Name
           <input
-            value={name}
-            onChange={(event) => setName(event.target.value)}
+            value={displayName}
+            onChange={(event) => setDisplayName(event.target.value)}
             placeholder="Enter display name"
           />
         </label>
 
-        <button type="submit">Enter Prototype</button>
+        <label>
+          Email
+          <input
+            type="email"
+            value={email}
+            onChange={(event) => setEmail(event.target.value)}
+            placeholder="you@example.com"
+          />
+        </label>
+
+        <label>
+          Password
+          <input
+            type="password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            placeholder="Enter password"
+          />
+        </label>
+
+        <button type="submit" disabled={isSubmitting}>
+          {isSubmitting
+            ? "Please wait..."
+            : mode === "login"
+            ? "Log In"
+            : "Create Account"}
+        </button>
+
+        {mode === "login" && (
+          <button
+            type="button"
+            className="text-link-button"
+            onClick={handleForgotPassword}
+            disabled={isResetting}
+          >
+            {isResetting ? "Sending reset email..." : "Forgot password?"}
+          </button>
+        )}
+
+        {authStatus && <p className="auth-status">{authStatus}</p>}
 
         <small>
-          Prototype login only. Persistent production authentication can be added
-          with a database service later.
+          Supabase Auth is used for prototype login and database-backed chat
+          history.
         </small>
       </form>
     </div>
@@ -209,28 +352,264 @@ function MessageContent({ content }) {
   );
 }
 
-function App() {
-  const [isLoggedIn, setIsLoggedIn] = useState(() => {
-    return localStorage.getItem(STORAGE_KEYS.loggedIn) === "true";
-  });
+function SettingsPanel({
+  user,
+  displayName,
+  recoveryMode,
+  onClose,
+  onProfileUpdated,
+  onPasswordUpdated,
+}) {
+  const [name, setName] = useState(displayName || "");
+  const [newPassword, setNewPassword] = useState("");
+  const [status, setStatus] = useState("");
+  const [isSavingName, setIsSavingName] = useState(false);
+  const [isChangingPassword, setIsChangingPassword] = useState(false);
 
-  const [displayName, setDisplayName] = useState(() => {
-    return localStorage.getItem(STORAGE_KEYS.displayName) || "Demo User";
-  });
+  async function handleUpdateName(event) {
+    event.preventDefault();
+
+    if (!user?.id) {
+      setStatus("No logged-in user found.");
+      return;
+    }
+
+    const cleanName = name.trim() || "EDA User";
+
+    setIsSavingName(true);
+    setStatus("");
+
+    try {
+      const { error } = await supabase.from("profiles").upsert({
+        id: user.id,
+        display_name: cleanName,
+      });
+
+      if (error) throw error;
+
+      onProfileUpdated(cleanName);
+      setStatus("Profile name updated.");
+    } catch (error) {
+      setStatus(error.message || "Failed to update profile.");
+    } finally {
+      setIsSavingName(false);
+    }
+  }
+
+  async function handleChangePassword(event) {
+    event.preventDefault();
+
+    const cleanPassword = newPassword.trim();
+
+    if (!cleanPassword) {
+      setStatus("Enter a new password first.");
+      return;
+    }
+
+    if (cleanPassword.length < 6) {
+      setStatus("Password should be at least 6 characters.");
+      return;
+    }
+
+    setIsChangingPassword(true);
+    setStatus("");
+
+    try {
+      const { error } = await supabase.auth.updateUser({
+        password: cleanPassword,
+      });
+
+      if (error) throw error;
+
+      setNewPassword("");
+      setStatus("Password updated successfully.");
+
+      if (onPasswordUpdated) {
+        onPasswordUpdated();
+      }
+    } catch (error) {
+      setStatus(error.message || "Failed to update password.");
+    } finally {
+      setIsChangingPassword(false);
+    }
+  }
+
+  return (
+    <div className="settings-card">
+      <div className="settings-header">
+        <div>
+          <h3>Settings</h3>
+          <p>Manage profile and password for this prototype account.</p>
+        </div>
+
+        <button className="close-settings-btn" onClick={onClose}>
+          Close
+        </button>
+      </div>
+
+      {recoveryMode && (
+        <p className="settings-status">
+          Password recovery mode is active. Enter a new password below to finish
+          resetting your account password.
+        </p>
+      )}
+
+      <form className="settings-section" onSubmit={handleUpdateName}>
+        <label>
+          Display Name
+          <input
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            placeholder="Display name"
+          />
+        </label>
+
+        <button type="submit" disabled={isSavingName}>
+          {isSavingName ? "Saving..." : "Update Name"}
+        </button>
+      </form>
+
+      <form className="settings-section" onSubmit={handleChangePassword}>
+        <label>
+          New Password
+          <input
+            type="password"
+            value={newPassword}
+            onChange={(event) => setNewPassword(event.target.value)}
+            placeholder="At least 6 characters"
+          />
+        </label>
+
+        <button type="submit" disabled={isChangingPassword}>
+          {isChangingPassword ? "Updating..." : "Change Password"}
+        </button>
+      </form>
+
+      {status && <p className="settings-status">{status}</p>}
+    </div>
+  );
+}
+
+function App() {
+  const [authLoading, setAuthLoading] = useState(true);
+  const [user, setUser] = useState(null);
+  const [displayName, setDisplayName] = useState("Demo User");
+
+  const [sessions, setSessions] = useState([]);
+  const [activeSessionId, setActiveSessionId] = useState(null);
 
   const [messages, setMessages] = useState(initialMessages);
   const [input, setInput] = useState("");
   const [attachments, setAttachments] = useState([]);
+
   const [currentStatus, setCurrentStatus] = useState("Ready");
   const [detectedCodes, setDetectedCodes] = useState([]);
   const [showAdvancedTrace, setShowAdvancedTrace] = useState(false);
-  const [historyItems, setHistoryItems] = useState(() => safeLoadHistory());
   const [lastTrace, setLastTrace] = useState(null);
   const [runningStage, setRunningStage] = useState("idle");
 
+  const [showSettings, setShowSettings] = useState(false);
+  const [passwordRecoveryMode, setPasswordRecoveryMode] = useState(false);
+  const [uiError, setUiError] = useState("");
+
   useEffect(() => {
-    saveHistory(historyItems);
-  }, [historyItems]);
+    let mounted = true;
+    let timeoutId;
+
+    async function loadAuthSession() {
+      try {
+        timeoutId = window.setTimeout(() => {
+          if (!mounted) return;
+
+          console.warn("Supabase auth check timed out. Showing login screen.");
+          setAuthLoading(false);
+          setUser(null);
+          setUiError(
+            "Supabase authentication check timed out. Check your .env keys and internet connection."
+          );
+        }, 8000);
+
+        const { data, error } = await supabase.auth.getSession();
+
+        if (!mounted) return;
+
+        if (error) {
+          console.warn("Auth session load failed:", error.message);
+          setUser(null);
+          setUiError(`Auth session load failed: ${error.message}`);
+          return;
+        }
+
+        const currentUser = data?.session?.user || null;
+        setUser(currentUser);
+
+        if (currentUser) {
+          await loadProfile(currentUser.id, currentUser.email);
+          await loadSessions(currentUser.id);
+        }
+      } catch (error) {
+        if (!mounted) return;
+
+        console.error("Unexpected auth loading error:", error);
+        setUser(null);
+        setUiError(
+          `Unexpected auth loading error: ${error?.message || String(error)}`
+        );
+      } finally {
+        if (timeoutId) {
+          window.clearTimeout(timeoutId);
+        }
+
+        if (mounted) {
+          setAuthLoading(false);
+        }
+      }
+    }
+
+    loadAuthSession();
+
+    const { data } = supabase.auth.onAuthStateChange(async (_event, session) => {
+      try {
+        const currentUser = session?.user || null;
+
+        setUser(currentUser);
+
+        if (_event === "PASSWORD_RECOVERY") {
+          setPasswordRecoveryMode(true);
+          setShowSettings(true);
+          setShowAdvancedTrace(false);
+          setUiError(
+            "Password recovery mode active. Enter your new password in Settings."
+          );
+        }
+
+        if (currentUser) {
+          await loadProfile(currentUser.id, currentUser.email);
+          await loadSessions(currentUser.id);
+        } else {
+          setDisplayName("Demo User");
+          setSessions([]);
+          setActiveSessionId(null);
+          setMessages(initialMessages);
+        }
+      } catch (error) {
+        console.error("Auth state change error:", error);
+        setUiError(`Auth state change error: ${error?.message || String(error)}`);
+      } finally {
+        setAuthLoading(false);
+      }
+    });
+
+    return () => {
+      mounted = false;
+
+      if (timeoutId) {
+        window.clearTimeout(timeoutId);
+      }
+
+      data?.subscription?.unsubscribe();
+    };
+  }, []);
 
   useEffect(() => {
     if (currentStatus !== "Running") {
@@ -238,55 +617,35 @@ function App() {
       return undefined;
     }
 
-    setRunningStage("orchestrator");
+    setRunningStage("backend");
 
-    const diagnosticTimer = setTimeout(() => {
-      setRunningStage("diagnostic");
-    }, 800);
-
-    const fixerTimer = setTimeout(() => {
-      setRunningStage("fixer");
-    }, 2400);
+    const agentTimer = setTimeout(() => {
+      setRunningStage("agentic");
+    }, 900);
 
     return () => {
-      clearTimeout(diagnosticTimer);
-      clearTimeout(fixerTimer);
+      clearTimeout(agentTimer);
     };
   }, [currentStatus]);
 
   const statusClass = statusClassMap[currentStatus] || "status-gray";
 
   const traceStatus = useMemo(() => {
+    const route = lastTrace?.route || lastTrace?.adk_trace?.app_name || "";
+
     if (currentStatus === "Ready") {
       return {
         backend: "waiting",
-        orchestrator: "waiting",
-        diagnostic: "waiting",
-        fixer: "waiting",
-        rag: "waiting",
+        agentic: "waiting",
       };
     }
 
     if (currentStatus === "Running") {
       return {
-        backend: "request active",
-        orchestrator:
-          runningStage === "orchestrator" ? "routing request" : "completed",
-        diagnostic:
-          runningStage === "diagnostic"
-            ? "extracting evidence + diagnosing"
-            : runningStage === "orchestrator"
-            ? "pending"
-            : "completed",
-        fixer:
-          runningStage === "fixer"
-            ? "generating fix / guidance"
-            : runningStage === "orchestrator" || runningStage === "diagnostic"
-            ? "pending"
-            : "completed",
-        rag:
-          runningStage === "diagnostic" || runningStage === "fixer"
-            ? "retrieving when matching codes exist"
+        backend: runningStage === "backend" ? "request active" : "ok",
+        agentic:
+          runningStage === "agentic"
+            ? "running EDA debugging pipeline"
             : "pending",
       };
     }
@@ -294,35 +653,178 @@ function App() {
     if (currentStatus === "Error") {
       return {
         backend: "error",
-        orchestrator: "check backend",
-        diagnostic: "check backend",
-        fixer: "check backend",
-        rag: "check backend",
+        agentic: "failed or interrupted",
       };
     }
 
     return {
       backend: "ok",
-      orchestrator: "completed",
-      diagnostic: "completed",
-      fixer: "completed",
-      rag: "retrieval used when matching codes exist",
+      agentic: route ? `completed (${route})` : "completed",
     };
-  }, [currentStatus, runningStage]);
+  }, [currentStatus, runningStage, lastTrace]);
 
-  function handleLogin(name) {
-    localStorage.setItem(STORAGE_KEYS.loggedIn, "true");
-    localStorage.setItem(STORAGE_KEYS.displayName, name);
-    setDisplayName(name);
-    setIsLoggedIn(true);
+  async function loadProfile(userId, fallbackEmail) {
+    const { data, error } = await supabase
+      .from("profiles")
+      .select("display_name")
+      .eq("id", userId)
+      .maybeSingle();
+
+    if (error) {
+      console.warn("Load profile failed:", error.message);
+      setDisplayName(fallbackEmail || "EDA User");
+      return;
+    }
+
+    setDisplayName(data?.display_name || fallbackEmail || "EDA User");
   }
 
-  function handleLogout() {
-    localStorage.removeItem(STORAGE_KEYS.loggedIn);
-    localStorage.removeItem(STORAGE_KEYS.displayName);
+  async function loadSessions(userId) {
+    const { data, error } = await supabase
+      .from("chat_sessions")
+      .select("*")
+      .eq("user_id", userId)
+      .order("updated_at", { ascending: false });
 
-    setIsLoggedIn(false);
+    if (error) {
+      setUiError(`Failed to load sessions: ${error.message}`);
+      return;
+    }
+
+    setSessions(data || []);
+  }
+
+  async function loadSessionMessages(sessionId) {
+    if (!user) return;
+
+    setUiError("");
+    setShowSettings(false);
+    setPasswordRecoveryMode(false);
+
+    const { data, error } = await supabase
+      .from("chat_messages")
+      .select("*")
+      .eq("session_id", sessionId)
+      .eq("user_id", user.id)
+      .order("created_at", { ascending: true });
+
+    if (error) {
+      setUiError(`Failed to load messages: ${error.message}`);
+      return;
+    }
+
+    const loadedMessages = (data || []).map((item) => ({
+      role: item.role,
+      content: item.content,
+      files: item.file_names || [],
+    }));
+
+    setActiveSessionId(sessionId);
+    setMessages(loadedMessages.length > 0 ? loadedMessages : initialMessages);
+
+    const session = sessions.find((item) => item.id === sessionId);
+
+    if (session?.last_fix_status) {
+      setCurrentStatus(session.last_fix_status);
+    } else {
+      setCurrentStatus("Ready");
+    }
+
+    setDetectedCodes(session?.detected_codes || []);
+    setLastTrace(null);
+    setRunningStage("idle");
+  }
+
+  async function createSession({
+    title = "New Debug Session",
+    status = null,
+    codes = [],
+  } = {}) {
+    if (!user) {
+      throw new Error("User is not logged in.");
+    }
+
+    const { data, error } = await supabase
+      .from("chat_sessions")
+      .insert({
+        user_id: user.id,
+        title,
+        last_fix_status: status,
+        detected_codes: codes,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      throw new Error(`Failed to create session: ${error.message}`);
+    }
+
+    setSessions((prev) => [data, ...prev]);
+    setActiveSessionId(data.id);
+
+    return data;
+  }
+
+  async function updateSession(sessionId, updates) {
+    if (!user || !sessionId) return;
+
+    const { data, error } = await supabase
+      .from("chat_sessions")
+      .update(updates)
+      .eq("id", sessionId)
+      .eq("user_id", user.id)
+      .select()
+      .single();
+
+    if (error) {
+      console.warn("Update session failed:", error.message);
+      return;
+    }
+
+    setSessions((prev) => {
+      const filtered = prev.filter((item) => item.id !== sessionId);
+      return [data, ...filtered];
+    });
+  }
+
+  async function saveMessage({
+    sessionId,
+    role,
+    content,
+    fileNames = [],
+    fixStatus = null,
+    codes = [],
+  }) {
+    if (!user || !sessionId) return;
+
+    const { error } = await supabase.from("chat_messages").insert({
+      session_id: sessionId,
+      user_id: user.id,
+      role,
+      content,
+      file_names: fileNames,
+      fix_status: fixStatus,
+      detected_codes: codes,
+    });
+
+    if (error) {
+      console.warn("Save message failed:", error.message);
+    }
+  }
+
+  async function handleAuthReady(currentUser) {
+    setUser(currentUser);
+    await loadProfile(currentUser.id, currentUser.email);
+    await loadSessions(currentUser.id);
+  }
+
+  async function handleLogout() {
+    await supabase.auth.signOut();
+
+    setUser(null);
     setDisplayName("Demo User");
+    setSessions([]);
+    setActiveSessionId(null);
     setMessages(initialMessages);
     setInput("");
     setAttachments([]);
@@ -331,6 +833,9 @@ function App() {
     setShowAdvancedTrace(false);
     setLastTrace(null);
     setRunningStage("idle");
+    setShowSettings(false);
+    setPasswordRecoveryMode(false);
+    setUiError("");
   }
 
   function handleFilesSelected(event) {
@@ -367,6 +872,11 @@ function App() {
       return;
     }
 
+    if (!user) {
+      setUiError("Please log in first.");
+      return;
+    }
+
     const finalUserMessage =
       trimmedMessage ||
       `Please analyze the attached files: ${filesForRequest
@@ -375,14 +885,19 @@ function App() {
 
     const fileNames = filesForRequest.map((file) => file.name);
 
-    setMessages((prev) => [
-      ...prev,
-      {
-        role: "user",
-        content: finalUserMessage,
-        files: fileNames,
-      },
-    ]);
+    setUiError("");
+    setShowSettings(false);
+    setPasswordRecoveryMode(false);
+
+    let sessionId = activeSessionId;
+
+    const userMessage = {
+      role: "user",
+      content: finalUserMessage,
+      files: fileNames,
+    };
+
+    setMessages((prev) => [...prev, userMessage]);
 
     setInput("");
     setAttachments([]);
@@ -391,6 +906,29 @@ function App() {
     setLastTrace(null);
 
     try {
+      if (!sessionId) {
+        const newSession = await createSession({
+          title: makeSessionTitle(filesForRequest, finalUserMessage, "Running"),
+          status: "Running",
+          codes: [],
+        });
+
+        sessionId = newSession.id;
+      }
+
+      await saveMessage({
+        sessionId,
+        role: "user",
+        content: finalUserMessage,
+        fileNames,
+      });
+
+      await updateSession(sessionId, {
+        title: makeSessionTitle(filesForRequest, finalUserMessage, "Running"),
+        last_fix_status: "Running",
+        detected_codes: [],
+      });
+
       const formData = new FormData();
       formData.append("message", finalUserMessage);
 
@@ -416,30 +954,33 @@ function App() {
         "No response returned from backend.";
 
       const status = inferFixStatus(answer);
-      const codes = extractDetectedCodes(answer);
+      const codes = data.detected_codes?.length
+        ? data.detected_codes
+        : extractDetectedCodes(answer);
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: "assistant",
-          content: answer,
-        },
-      ]);
+      const assistantMessage = {
+        role: "assistant",
+        content: answer,
+      };
 
+      setMessages((prev) => [...prev, assistantMessage]);
       setCurrentStatus(status);
       setDetectedCodes(codes);
       setLastTrace(data.trace || null);
 
-      setHistoryItems((prev) => [
-        {
-          id: Date.now(),
-          title: makeSessionTitle(filesForRequest, finalUserMessage, status),
-          status,
-          codes,
-          createdAt: new Date().toISOString(),
-        },
-        ...prev,
-      ]);
+      await saveMessage({
+        sessionId,
+        role: "assistant",
+        content: answer,
+        fixStatus: status,
+        codes,
+      });
+
+      await updateSession(sessionId, {
+        title: makeSessionTitle(filesForRequest, finalUserMessage, status),
+        last_fix_status: status,
+        detected_codes: codes,
+      });
     } catch (error) {
       const errorMessage = `Backend request failed.\n\n${error.message}`;
 
@@ -456,6 +997,21 @@ function App() {
         backend: "failed",
         error: error.message,
       });
+
+      if (sessionId) {
+        await saveMessage({
+          sessionId,
+          role: "assistant",
+          content: errorMessage,
+          fixStatus: "Error",
+          codes: [],
+        });
+
+        await updateSession(sessionId, {
+          last_fix_status: "Error",
+          detected_codes: [],
+        });
+      }
     }
   }
 
@@ -471,6 +1027,7 @@ function App() {
   }
 
   function handleNewChat() {
+    setActiveSessionId(null);
     setMessages(initialMessages);
     setInput("");
     setAttachments([]);
@@ -479,15 +1036,54 @@ function App() {
     setShowAdvancedTrace(false);
     setLastTrace(null);
     setRunningStage("idle");
+    setShowSettings(false);
+    setPasswordRecoveryMode(false);
+    setUiError("");
   }
 
-  function clearHistory() {
-    setHistoryItems([]);
-    localStorage.removeItem(STORAGE_KEYS.history);
+  function handleOpenSettings() {
+    setShowSettings(true);
+    setShowAdvancedTrace(false);
+    setUiError("");
   }
 
-  if (!isLoggedIn) {
-    return <LoginScreen onLogin={handleLogin} />;
+  function handlePasswordUpdated() {
+    setPasswordRecoveryMode(false);
+    setUiError("Password updated successfully.");
+  }
+
+  async function deleteSession(sessionId) {
+    if (!user || !sessionId) return;
+
+    const { error } = await supabase
+      .from("chat_sessions")
+      .delete()
+      .eq("id", sessionId)
+      .eq("user_id", user.id);
+
+    if (error) {
+      setUiError(`Failed to delete session: ${error.message}`);
+      return;
+    }
+
+    setSessions((prev) => prev.filter((item) => item.id !== sessionId));
+
+    if (activeSessionId === sessionId) {
+      handleNewChat();
+    }
+  }
+
+  if (authLoading) {
+    return (
+      <div className="loading-page">
+        <div className="agent-spinner large-spinner" />
+        <p>Loading EDA Debugger...</p>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return <LoginScreen onAuthReady={handleAuthReady} />;
   }
 
   return (
@@ -508,12 +1104,34 @@ function App() {
               New Chat
             </button>
 
-            <button onClick={() => setShowAdvancedTrace((value) => !value)}>
-              Debug Trace
-            </button>
-
-            <button disabled>Settings</button>
+            <button onClick={handleOpenSettings}>Settings</button>
           </nav>
+
+          <section className="sidebar-history">
+            <div className="sidebar-history-header">
+              <h2>History</h2>
+              <span>{sessions.length}</span>
+            </div>
+
+            <div className="sidebar-history-list">
+              {sessions.length === 0 ? (
+                <p>No saved chats yet.</p>
+              ) : (
+                sessions.map((session) => (
+                  <button
+                    key={session.id}
+                    className={`sidebar-history-item ${
+                      activeSessionId === session.id ? "active-session" : ""
+                    }`}
+                    onClick={() => loadSessionMessages(session.id)}
+                  >
+                    <span>{session.title}</span>
+                    <small>{session.last_fix_status || "No status"}</small>
+                  </button>
+                ))
+              )}
+            </div>
+          </section>
         </div>
 
         <div className="sidebar-footer">
@@ -524,7 +1142,7 @@ function App() {
 
             <div>
               <p className="user-name">{displayName}</p>
-              <p className="user-role">Research prototype</p>
+              <p className="user-role">{user.email}</p>
             </div>
           </div>
 
@@ -549,76 +1167,107 @@ function App() {
           </div>
         </header>
 
-        <section className="messages">
-          {messages.map((message, index) => (
-            <div
-              key={`${message.role}-${index}`}
-              className={`message-row ${
-                message.role === "user" ? "message-user" : "message-assistant"
-              }`}
-            >
-              <div className="message-avatar">
-                {message.role === "user"
-                  ? displayName.slice(0, 1).toUpperCase()
-                  : "A"}
-              </div>
+        {uiError && <div className="ui-error">{uiError}</div>}
 
-              <div className="message-bubble">
-                {message.files && message.files.length > 0 && (
-                  <div className="message-files">
-                    {message.files.map((name) => (
-                      <span key={name} className="file-pill">
-                        {name}
-                      </span>
-                    ))}
-                  </div>
-                )}
+        {showSettings ? (
+          <SettingsPanel
+            user={user}
+            displayName={displayName}
+            recoveryMode={passwordRecoveryMode}
+            onClose={() => {
+              setShowSettings(false);
+              setPasswordRecoveryMode(false);
+            }}
+            onProfileUpdated={(newName) => setDisplayName(newName)}
+            onPasswordUpdated={handlePasswordUpdated}
+          />
+        ) : (
+          <section className="messages">
+            {messages.map((message, index) => (
+              <div
+                key={`${message.role}-${index}`}
+                className={`message-row ${
+                  message.role === "user" ? "message-user" : "message-assistant"
+                }`}
+              >
+                <div className="message-avatar">
+                  {message.role === "user"
+                    ? displayName.slice(0, 1).toUpperCase()
+                    : "A"}
+                </div>
 
-                <MessageContent content={message.content} />
+                <div className="message-bubble">
+                  {message.files && message.files.length > 0 && (
+                    <div className="message-files">
+                      {message.files.map((name) => (
+                        <span key={name} className="file-pill">
+                          {name}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+
+                  <MessageContent content={message.content} />
+                </div>
               </div>
-            </div>
-          ))}
-        </section>
+            ))}
+          </section>
+        )}
 
         <footer className="composer-wrap">
-          <div className="file-strip">
-            <label className="attach-chip">
-              <input type="file" multiple onChange={handleFilesSelected} />
-              <span>Attach Files</span>
-            </label>
+          {!showSettings && (
+            <>
+              <div className="file-strip">
+                <label className="attach-chip">
+                  <input type="file" multiple onChange={handleFilesSelected} />
+                  <span>Attach Files</span>
+                </label>
 
-            <div className="selected-files">
-              {attachments.length === 0 ? (
-                <span>No files attached</span>
-              ) : (
-                attachments.map((file) => (
-                  <span key={`${file.name}-${file.size}`} className="file-pill">
-                    {file.name}
-                  </span>
-                ))
-              )}
-            </div>
+                <div className="selected-files">
+                  {attachments.length === 0 ? (
+                    <span>No files attached</span>
+                  ) : (
+                    attachments.map((file) => (
+                      <span
+                        key={`${file.name}-${file.size}`}
+                        className="file-pill"
+                      >
+                        {file.name}
+                      </span>
+                    ))
+                  )}
+                </div>
 
-            {attachments.length > 0 && (
-              <button className="clear-files-btn" onClick={clearAttachments}>
-                Clear
-              </button>
-            )}
-          </div>
+                {attachments.length > 0 && (
+                  <button className="clear-files-btn" onClick={clearAttachments}>
+                    Clear
+                  </button>
+                )}
+              </div>
 
-          <div className="composer">
-            <textarea
-              value={input}
-              placeholder="Ask the orchestrator a question, or attach Tcl and log files for debugging..."
-              onChange={(event) => setInput(event.target.value)}
-              onKeyDown={handleKeyDown}
-              disabled={currentStatus === "Running"}
-            />
+              <div className="composer">
+                <textarea
+                  value={input}
+                  placeholder="Ask a question, or attach Tcl and log files for debugging..."
+                  onChange={(event) => setInput(event.target.value)}
+                  onKeyDown={handleKeyDown}
+                  disabled={currentStatus === "Running"}
+                />
 
-            <button onClick={handleSend} disabled={currentStatus === "Running"}>
-              {currentStatus === "Running" ? "Running..." : "Send"}
-            </button>
-          </div>
+                <button
+                  onClick={handleSend}
+                  disabled={currentStatus === "Running"}
+                >
+                  {currentStatus === "Running" ? "Running..." : "Send"}
+                </button>
+              </div>
+            </>
+          )}
+
+          <p className="disclaimer">
+            EDADebugger can make mistakes. Check and clarify important
+            information.
+          </p>
         </footer>
       </main>
 
@@ -640,38 +1289,13 @@ function App() {
             <TraceStatus
               label="Backend API"
               status={traceStatus.backend}
-              spinning={currentStatus === "Running"}
+              spinning={currentStatus === "Running" && runningStage === "backend"}
             />
 
             <TraceStatus
-              label="Google ADK Orchestrator"
-              status={traceStatus.orchestrator}
-              spinning={
-                currentStatus === "Running" && runningStage === "orchestrator"
-              }
-            />
-
-            <TraceStatus
-              label="Diagnostic Agent"
-              status={traceStatus.diagnostic}
-              spinning={
-                currentStatus === "Running" && runningStage === "diagnostic"
-              }
-            />
-
-            <TraceStatus
-              label="Script Fixer Agent"
-              status={traceStatus.fixer}
-              spinning={currentStatus === "Running" && runningStage === "fixer"}
-            />
-
-            <TraceStatus
-              label="Neo4j RAG"
-              status={traceStatus.rag}
-              spinning={
-                currentStatus === "Running" &&
-                (runningStage === "diagnostic" || runningStage === "fixer")
-              }
+              label="Agentic AI System"
+              status={traceStatus.agentic}
+              spinning={currentStatus === "Running" && runningStage === "agentic"}
             />
 
             {detectedCodes.length > 0 && (
@@ -680,52 +1304,42 @@ function App() {
                 <span>{detectedCodes.join(", ")}</span>
               </div>
             )}
-
-            {lastTrace && (
-              <div className="trace-row">
-                <strong>Backend Trace</strong>
-                <span>{JSON.stringify(lastTrace)}</span>
-              </div>
-            )}
           </section>
         )}
 
         <div className="history-header small-header">
-          <h3>History</h3>
-          <span>{historyItems.length} runs</span>
+          <h3>Run Summary</h3>
         </div>
 
         <div className="history-list">
-          {historyItems.length === 0 ? (
-            <p className="empty-history">No debug runs yet.</p>
+          {!activeSessionId ? (
+            <p className="empty-history">No active saved session yet.</p>
           ) : (
-            historyItems.map((item) => (
-              <button key={item.id} className="history-item">
-                <strong>{item.title}</strong>
+            <div className="history-item static-item">
+              <strong>
+                {sessions.find((item) => item.id === activeSessionId)?.title ||
+                  "Current session"}
+              </strong>
 
-                <p>
-                  {item.codes && item.codes.length > 0
-                    ? item.codes.join(", ")
-                    : "No codes detected"}
-                </p>
+              <p>
+                {detectedCodes.length > 0
+                  ? detectedCodes.join(", ")
+                  : "No codes detected"}
+              </p>
 
-                <span
-                  className={`mini-status ${
-                    statusClassMap[item.status] || "status-gray"
-                  }`}
-                >
-                  {item.status}
-                </span>
+              <span className={`mini-status ${statusClass}`}>
+                {currentStatus}
+              </span>
+
+              <button
+                className="delete-session-btn"
+                onClick={() => deleteSession(activeSessionId)}
+              >
+                Delete Session
               </button>
-            ))
+            </div>
           )}
         </div>
-
-        {historyItems.length > 0 && (
-          <button className="clear-history-btn" onClick={clearHistory}>
-            Clear History
-          </button>
-        )}
       </aside>
     </div>
   );

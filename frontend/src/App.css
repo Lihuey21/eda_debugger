@@ -30,6 +30,7 @@ button:disabled {
   opacity: 0.65;
 }
 
+.loading-page,
 .login-page {
   min-height: 100vh;
   display: grid;
@@ -38,8 +39,14 @@ button:disabled {
   padding: 24px;
 }
 
+.loading-page {
+  gap: 14px;
+  color: #64748b;
+  font-weight: 800;
+}
+
 .login-card {
-  width: min(440px, 100%);
+  width: min(460px, 100%);
   background: #ffffff;
   border: 1px solid #e2e8f0;
   border-radius: 30px;
@@ -62,14 +69,40 @@ button:disabled {
   line-height: 1.55;
 }
 
-.login-card label {
+.auth-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  background: #f1f5f9;
+  border-radius: 18px;
+  padding: 6px;
+}
+
+.auth-tabs button {
+  border: none;
+  border-radius: 14px;
+  padding: 12px;
+  background: transparent;
+  color: #64748b;
+  font-weight: 900;
+}
+
+.auth-tabs .auth-tab-active {
+  background: #ffffff;
+  color: #0f172a;
+  box-shadow: 0 8px 24px rgba(15, 23, 42, 0.08);
+}
+
+.login-card label,
+.settings-section label {
   display: grid;
   gap: 8px;
   font-weight: 800;
   color: #1e293b;
 }
 
-.login-card input {
+.login-card input,
+.settings-section input {
   border: 1px solid #dbe4f0;
   border-radius: 16px;
   padding: 15px 16px;
@@ -78,13 +111,15 @@ button:disabled {
   background: #f8fafc;
 }
 
-.login-card input:focus {
+.login-card input:focus,
+.settings-section input:focus {
   border-color: #ff7a1a;
   box-shadow: 0 0 0 4px rgba(255, 122, 26, 0.13);
   background: #ffffff;
 }
 
-.login-card button {
+.login-card button[type="submit"],
+.settings-section button {
   border: none;
   border-radius: 18px;
   padding: 15px 18px;
@@ -93,6 +128,27 @@ button:disabled {
   font-weight: 900;
   font-size: 15px;
   box-shadow: 0 16px 35px rgba(255, 122, 26, 0.26);
+}
+
+.text-link-button {
+  border: none;
+  background: transparent;
+  color: #2563eb;
+  font-weight: 900;
+  padding: 0;
+  text-align: left;
+  width: fit-content;
+}
+
+.auth-status,
+.settings-status {
+  background: #f8fafc;
+  border: 1px solid #dbe4f0;
+  border-radius: 16px;
+  padding: 12px;
+  color: #475569 !important;
+  font-size: 14px;
+  line-height: 1.45;
 }
 
 .login-card small {
@@ -180,6 +236,71 @@ button:disabled {
   color: #ffffff !important;
 }
 
+.sidebar-history {
+  margin-top: 26px;
+}
+
+.sidebar-history-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  color: #cbd5e1;
+  margin-bottom: 12px;
+}
+
+.sidebar-history-header h2 {
+  margin: 0;
+  font-size: 15px;
+}
+
+.sidebar-history-header span {
+  color: #94a3b8;
+  font-size: 13px;
+  font-weight: 900;
+}
+
+.sidebar-history-list {
+  display: grid;
+  gap: 10px;
+  max-height: 330px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.sidebar-history-list p {
+  color: #94a3b8;
+  margin: 0;
+  font-size: 14px;
+}
+
+.sidebar-history-item {
+  border: 1px solid transparent;
+  background: transparent;
+  border-radius: 16px;
+  padding: 12px;
+  display: grid;
+  gap: 5px;
+  text-align: left;
+  color: #e5e7eb;
+}
+
+.sidebar-history-item:hover,
+.sidebar-history-item.active-session {
+  background: #1f2937;
+  border-color: #334155;
+}
+
+.sidebar-history-item span {
+  font-weight: 900;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-history-item small {
+  color: #94a3b8;
+}
+
 .sidebar-footer {
   display: grid;
   gap: 14px;
@@ -203,17 +324,26 @@ button:disabled {
   background: #ff6b00;
   color: #ffffff;
   font-weight: 900;
+  flex: 0 0 auto;
 }
 
 .user-name {
   margin: 0;
   font-weight: 900;
+  max-width: 170px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .user-role {
   margin: 4px 0 0;
   color: #94a3b8;
-  font-size: 13px;
+  font-size: 12px;
+  max-width: 170px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .logout-btn {
@@ -231,7 +361,7 @@ button:disabled {
   padding: 26px;
   min-height: calc(100vh - 36px);
   display: grid;
-  grid-template-rows: auto 1fr auto;
+  grid-template-rows: auto auto 1fr auto;
   box-shadow: 0 22px 70px rgba(15, 23, 42, 0.08);
   overflow: hidden;
 }
@@ -270,6 +400,15 @@ button:disabled {
   padding: 12px 16px;
   font-size: 13px;
   font-weight: 900;
+}
+
+.ui-error {
+  margin-top: 14px;
+  background: #fee2e2;
+  color: #991b1b;
+  border-radius: 16px;
+  padding: 12px 14px;
+  font-weight: 800;
 }
 
 .messages {
@@ -379,6 +518,52 @@ button:disabled {
   white-space: pre;
 }
 
+.settings-card {
+  margin-top: 24px;
+  padding: 24px;
+  border: 1px solid #e2e8f0;
+  background: #f8fafc;
+  border-radius: 26px;
+  display: grid;
+  gap: 20px;
+  align-self: start;
+}
+
+.settings-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+}
+
+.settings-header h3 {
+  margin: 0;
+  font-size: 24px;
+}
+
+.settings-header p {
+  margin: 6px 0 0;
+  color: #64748b;
+}
+
+.close-settings-btn {
+  border: none;
+  background: #e2e8f0;
+  color: #0f172a;
+  border-radius: 999px;
+  padding: 10px 14px;
+  font-weight: 900;
+}
+
+.settings-section {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 20px;
+  padding: 18px;
+  display: grid;
+  gap: 14px;
+}
+
 .composer-wrap {
   border: 1px solid #e2e8f0;
   border-radius: 26px;
@@ -420,7 +605,7 @@ button:disabled {
 }
 
 .clear-files-btn,
-.clear-history-btn {
+.delete-session-btn {
   border: none;
   background: #fee2e2;
   color: #991b1b;
@@ -459,6 +644,14 @@ button:disabled {
   padding: 18px 24px;
   min-width: 92px;
   box-shadow: 0 16px 35px rgba(255, 107, 0, 0.24);
+}
+
+.disclaimer {
+  margin: 12px 4px 0;
+  color: #94a3b8;
+  font-size: 12px;
+  line-height: 1.4;
+  text-align: center;
 }
 
 .history-panel {
@@ -578,6 +771,12 @@ button:disabled {
   flex: 0 0 auto;
 }
 
+.large-spinner {
+  width: 28px;
+  height: 28px;
+  border-width: 3px;
+}
+
 @keyframes spin {
   to {
     transform: rotate(360deg);
@@ -601,9 +800,8 @@ button:disabled {
   gap: 8px;
 }
 
-.history-item:hover {
-  border-color: #cbd5e1;
-  box-shadow: 0 16px 40px rgba(15, 23, 42, 0.08);
+.history-item.static-item {
+  cursor: default;
 }
 
 .history-item strong {
@@ -626,14 +824,9 @@ button:disabled {
   background: #f8fafc;
 }
 
-.clear-history-btn {
-  width: 100%;
-  margin-top: 16px;
-}
-
 @media (max-width: 1180px) {
   .app-shell {
-    grid-template-columns: 240px minmax(0, 1fr);
+    grid-template-columns: 260px minmax(0, 1fr);
   }
 
   .history-panel {
