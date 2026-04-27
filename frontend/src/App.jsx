@@ -92,7 +92,7 @@ function LoginScreen({ onAuthReady }) {
 
     const cleanEmail = email.trim();
     const cleanPassword = password.trim();
-    const cleanName = displayName.trim() || "";
+    const cleanName = displayName.trim() || cleanEmail;
 
     if (!cleanEmail || !cleanPassword) {
       setAuthStatus("Please enter both email and password.");
@@ -380,7 +380,7 @@ function SettingsPanel({
       return;
     }
 
-    const cleanName = name.trim() || "EDA User";
+    const cleanName = name.trim() || user.email || "EDA User";
 
     setIsSavingName(true);
     setStatus("");
@@ -591,7 +591,7 @@ function App() {
           await loadProfile(currentUser.id, currentUser.email);
           await loadSessions(currentUser.id);
         } else {
-          setDisplayName("Demo User");
+          setDisplayName("");
           setSessions([]);
           setActiveSessionId(null);
           setMessages(initialMessages);
@@ -941,7 +941,7 @@ function App() {
     await supabase.auth.signOut();
 
     setUser(null);
-    setDisplayName("Demo User");
+    setDisplayName("");
     setSessions([]);
     setActiveSessionId(null);
     setMessages(initialMessages);
@@ -1321,11 +1321,11 @@ function App() {
         <div className="sidebar-footer">
           <div className="user-card">
             <div className="avatar">
-              {displayName.slice(0, 1).toUpperCase()}
+              {(displayName || user.email || "E").slice(0, 1).toUpperCase()}
             </div>
 
             <div>
-              <p className="user-name">{displayName}</p>
+              <p className="user-name">{displayName || user.email}</p>
               <p className="user-role">{user.email}</p>
             </div>
           </div>
@@ -1376,7 +1376,7 @@ function App() {
               >
                 <div className="message-avatar">
                   {message.role === "user"
-                    ? displayName.slice(0, 1).toUpperCase()
+                    ? (displayName || user.email || "U").slice(0, 1).toUpperCase()
                     : "A"}
                 </div>
 
@@ -1463,7 +1463,7 @@ function App() {
 
           <p className="disclaimer">
             EDADebugger can make mistakes. Check and clarify important
-            information.
+            information before applying fixes to real EDA flows.
           </p>
         </footer>
       </main>
