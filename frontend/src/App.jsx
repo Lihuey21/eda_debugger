@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import "./App.css";
 import { supabase } from "./supabaseClient";
 
@@ -18,6 +18,7 @@ const statusClassMap = {
   Running: "status-blue",
   Completed: "status-green",
   Error: "status-orange",
+  Cancelled: "status-gray",
   "Auto Fixed": "status-green",
   "Manual Fix Required": "status-orange",
   "Partial Fix Applied": "status-blue",
@@ -31,6 +32,7 @@ function inferFixStatus(answer) {
   if (text.includes("manual fix required")) return "Manual Fix Required";
   if (text.includes("auto fixed")) return "Auto Fixed";
   if (text.includes("no fix needed")) return "No Fix Needed";
+  if (text.includes("request cancelled")) return "Cancelled";
 
   return "Completed";
 }
@@ -56,9 +58,13 @@ function makeSessionTitle(files, message, status) {
   return status || "debug_session";
 }
 
+function isTemporarySessionId(sessionId) {
+  return typeof sessionId === "string" && sessionId.startsWith("temp-");
+}
+
 function LoginScreen({ onAuthReady }) {
   const [mode, setMode] = useState("login");
-  const [displayName, setDisplayName] = useState("Demo User");
+  const [displayName, setDisplayName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
 
@@ -86,7 +92,7 @@ function LoginScreen({ onAuthReady }) {
 
     const cleanEmail = email.trim();
     const cleanPassword = password.trim();
-    const cleanName = displayName.trim() || "Demo User";
+    const cleanName = displayName.trim() || "";
 
     if (!cleanEmail || !cleanPassword) {
       setAuthStatus("Please enter both email and password.");
@@ -491,9 +497,11 @@ function SettingsPanel({
 }
 
 function App() {
+  const activeAbortControllerRef = useRef(null);
+
   const [authLoading, setAuthLoading] = useState(true);
   const [user, setUser] = useState(null);
-  const [displayName, setDisplayName] = useState("Demo User");
+  const [displayName, setDisplayName] = useState("");
 
   const [sessions, setSessions] = useState([]);
   const [activeSessionId, setActiveSessionId] = useState(null);
@@ -607,6 +615,11 @@ function App() {
         window.clearTimeout(timeoutId);
       }
 
+      if (activeAbortControllerRef.current) {
+        activeAbortControllerRef.current.abort();
+        activeAbortControllerRef.current = null;
+      }
+
       data?.subscription?.unsubscribe();
     };
   }, []);
@@ -628,6 +641,7 @@ function App() {
     };
   }, [currentStatus]);
 
+  const activeSession = sessions.find((item) => item.id === activeSessionId);
   const statusClass = statusClassMap[currentStatus] || "status-gray";
 
   const traceStatus = useMemo(() => {
@@ -654,6 +668,13 @@ function App() {
       return {
         backend: "error",
         agentic: "failed or interrupted",
+      };
+    }
+
+    if (currentStatus === "Cancelled") {
+      return {
+        backend: "cancelled",
+        agentic: "cancelled by user",
       };
     }
 
@@ -694,12 +715,104 @@ function App() {
     setSessions(data || []);
   }
 
+  function createTemporarySession(title) {
+    const tempId = `temp-${Date.now()}`;
+
+    const tempSession = {
+      id: tempId,
+      user_id: user?.id || null,
+      title,
+      last_fix_status: "Running",
+      detected_codes: [],
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+      is_temporary: true,
+    };
+
+    setSessions((prev) => [tempSession, ...prev]);
+    setActiveSessionId(tempId);
+
+    return tempId;
+  }
+
+  function replaceTemporarySession(tempId, realSession) {
+    setSessions((prev) => {
+      const withoutTemp = prev.filter((item) => item.id !== tempId);
+      return [realSession, ...withoutTemp];
+    });
+
+    setActiveSessionId(realSession.id);
+  }
+
+  function updateLocalSession(sessionId, updates) {
+    if (!sessionId) return;
+
+    setSessions((prev) =>
+      prev.map((session) =>
+        session.id === sessionId
+          ? {
+              ...session,
+              ...updates,
+              updated_at: new Date().toISOString(),
+            }
+          : session
+      )
+    );
+  }
+
+  function cancelActiveRequest({ addMessage = false } = {}) {
+    if (activeAbortControllerRef.current) {
+      activeAbortControllerRef.current.abort();
+      activeAbortControllerRef.current = null;
+    }
+
+    setCurrentStatus("Cancelled");
+    setRunningStage("idle");
+    setLastTrace({
+      backend: "cancelled",
+      message: "Request cancelled by user.",
+    });
+
+    if (activeSessionId) {
+      updateLocalSession(activeSessionId, {
+        last_fix_status: "Cancelled",
+        detected_codes: [],
+      });
+    }
+
+    if (addMessage) {
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: "assistant",
+          content: "Request cancelled by user.",
+        },
+      ]);
+    }
+  }
+
   async function loadSessionMessages(sessionId) {
-    if (!user) return;
+    if (!user || !sessionId) return;
+
+    if (activeAbortControllerRef.current) {
+      cancelActiveRequest({ addMessage: false });
+    }
 
     setUiError("");
     setShowSettings(false);
     setPasswordRecoveryMode(false);
+    setShowAdvancedTrace(false);
+
+    const selectedSession = sessions.find((item) => item.id === sessionId);
+
+    if (selectedSession?.is_temporary || isTemporarySessionId(sessionId)) {
+      setActiveSessionId(sessionId);
+      setCurrentStatus(selectedSession?.last_fix_status || "Running");
+      setDetectedCodes(selectedSession?.detected_codes || []);
+      setLastTrace(null);
+      setRunningStage("idle");
+      return;
+    }
 
     const { data, error } = await supabase
       .from("chat_messages")
@@ -722,15 +835,18 @@ function App() {
     setActiveSessionId(sessionId);
     setMessages(loadedMessages.length > 0 ? loadedMessages : initialMessages);
 
-    const session = sessions.find((item) => item.id === sessionId);
-
-    if (session?.last_fix_status) {
-      setCurrentStatus(session.last_fix_status);
+    if (selectedSession?.last_fix_status === "Running") {
+      setCurrentStatus("Cancelled");
+      updateLocalSession(sessionId, {
+        last_fix_status: "Cancelled",
+      });
+    } else if (selectedSession?.last_fix_status) {
+      setCurrentStatus(selectedSession.last_fix_status);
     } else {
       setCurrentStatus("Ready");
     }
 
-    setDetectedCodes(session?.detected_codes || []);
+    setDetectedCodes(selectedSession?.detected_codes || []);
     setLastTrace(null);
     setRunningStage("idle");
   }
@@ -759,14 +875,17 @@ function App() {
       throw new Error(`Failed to create session: ${error.message}`);
     }
 
-    setSessions((prev) => [data, ...prev]);
-    setActiveSessionId(data.id);
-
     return data;
   }
 
   async function updateSession(sessionId, updates) {
     if (!user || !sessionId) return;
+
+    updateLocalSession(sessionId, updates);
+
+    if (isTemporarySessionId(sessionId)) {
+      return;
+    }
 
     const { data, error } = await supabase
       .from("chat_sessions")
@@ -795,7 +914,7 @@ function App() {
     fixStatus = null,
     codes = [],
   }) {
-    if (!user || !sessionId) return;
+    if (!user || !sessionId || isTemporarySessionId(sessionId)) return;
 
     const { error } = await supabase.from("chat_messages").insert({
       session_id: sessionId,
@@ -819,6 +938,10 @@ function App() {
   }
 
   async function handleLogout() {
+    if (activeAbortControllerRef.current) {
+      cancelActiveRequest({ addMessage: false });
+    }
+
     await supabase.auth.signOut();
 
     setUser(null);
@@ -884,12 +1007,15 @@ function App() {
         .join(", ")}.`;
 
     const fileNames = filesForRequest.map((file) => file.name);
+    const sessionTitle = makeSessionTitle(
+      filesForRequest,
+      finalUserMessage,
+      "Running"
+    );
 
     setUiError("");
     setShowSettings(false);
     setPasswordRecoveryMode(false);
-
-    let sessionId = activeSessionId;
 
     const userMessage = {
       role: "user",
@@ -898,22 +1024,37 @@ function App() {
     };
 
     setMessages((prev) => [...prev, userMessage]);
-
     setInput("");
     setAttachments([]);
     setCurrentStatus("Running");
     setDetectedCodes([]);
     setLastTrace(null);
 
+    let sessionId = activeSessionId;
+
+    if (!sessionId) {
+      sessionId = createTemporarySession(sessionTitle);
+    } else {
+      updateLocalSession(sessionId, {
+        title: sessionTitle,
+        last_fix_status: "Running",
+        detected_codes: [],
+      });
+    }
+
+    const controller = new AbortController();
+    activeAbortControllerRef.current = controller;
+
     try {
-      if (!sessionId) {
-        const newSession = await createSession({
-          title: makeSessionTitle(filesForRequest, finalUserMessage, "Running"),
+      if (isTemporarySessionId(sessionId)) {
+        const realSession = await createSession({
+          title: sessionTitle,
           status: "Running",
           codes: [],
         });
 
-        sessionId = newSession.id;
+        replaceTemporarySession(sessionId, realSession);
+        sessionId = realSession.id;
       }
 
       await saveMessage({
@@ -924,7 +1065,7 @@ function App() {
       });
 
       await updateSession(sessionId, {
-        title: makeSessionTitle(filesForRequest, finalUserMessage, "Running"),
+        title: sessionTitle,
         last_fix_status: "Running",
         detected_codes: [],
       });
@@ -939,6 +1080,7 @@ function App() {
       const response = await fetch(`${API_BASE_URL}/chat`, {
         method: "POST",
         body: formData,
+        signal: controller.signal,
       });
 
       if (!response.ok) {
@@ -977,12 +1119,16 @@ function App() {
       });
 
       await updateSession(sessionId, {
-        title: makeSessionTitle(filesForRequest, finalUserMessage, status),
+        title: sessionTitle,
         last_fix_status: status,
         detected_codes: codes,
       });
     } catch (error) {
-      const errorMessage = `Backend request failed.\n\n${error.message}`;
+      const wasCancelled = error.name === "AbortError";
+
+      const errorMessage = wasCancelled
+        ? "Request cancelled by user."
+        : `Backend request failed.\n\n${error.message}`;
 
       setMessages((prev) => [
         ...prev,
@@ -992,26 +1138,42 @@ function App() {
         },
       ]);
 
-      setCurrentStatus("Error");
+      const finalStatus = wasCancelled ? "Cancelled" : "Error";
+
+      setCurrentStatus(finalStatus);
+      setRunningStage("idle");
       setLastTrace({
-        backend: "failed",
-        error: error.message,
+        backend: wasCancelled ? "cancelled" : "failed",
+        error: wasCancelled ? "Request cancelled by user." : error.message,
       });
 
-      if (sessionId) {
-        await saveMessage({
-          sessionId,
-          role: "assistant",
-          content: errorMessage,
-          fixStatus: "Error",
-          codes: [],
-        });
+      await saveMessage({
+        sessionId,
+        role: "assistant",
+        content: errorMessage,
+        fixStatus: finalStatus,
+        codes: [],
+      });
 
-        await updateSession(sessionId, {
-          last_fix_status: "Error",
-          detected_codes: [],
-        });
+      await updateSession(sessionId, {
+        last_fix_status: finalStatus,
+        detected_codes: [],
+      });
+    } finally {
+      if (activeAbortControllerRef.current === controller) {
+        activeAbortControllerRef.current = null;
       }
+    }
+  }
+
+  function handleCancelButton() {
+    cancelActiveRequest({ addMessage: true });
+
+    if (activeSessionId) {
+      updateSession(activeSessionId, {
+        last_fix_status: "Cancelled",
+        detected_codes: [],
+      });
     }
   }
 
@@ -1027,6 +1189,17 @@ function App() {
   }
 
   function handleNewChat() {
+    if (activeAbortControllerRef.current) {
+      cancelActiveRequest({ addMessage: false });
+
+      if (activeSessionId) {
+        updateSession(activeSessionId, {
+          last_fix_status: "Cancelled",
+          detected_codes: [],
+        });
+      }
+    }
+
     setActiveSessionId(null);
     setMessages(initialMessages);
     setInput("");
@@ -1042,6 +1215,10 @@ function App() {
   }
 
   function handleOpenSettings() {
+    if (activeAbortControllerRef.current) {
+      cancelActiveRequest({ addMessage: false });
+    }
+
     setShowSettings(true);
     setShowAdvancedTrace(false);
     setUiError("");
@@ -1054,6 +1231,16 @@ function App() {
 
   async function deleteSession(sessionId) {
     if (!user || !sessionId) return;
+
+    if (activeAbortControllerRef.current) {
+      cancelActiveRequest({ addMessage: false });
+    }
+
+    if (isTemporarySessionId(sessionId)) {
+      setSessions((prev) => prev.filter((item) => item.id !== sessionId));
+      handleNewChat();
+      return;
+    }
 
     const { error } = await supabase
       .from("chat_sessions")
@@ -1120,6 +1307,7 @@ function App() {
                 sessions.map((session) => (
                   <button
                     key={session.id}
+                    type="button"
                     className={`sidebar-history-item ${
                       activeSessionId === session.id ? "active-session" : ""
                     }`}
@@ -1254,12 +1442,25 @@ function App() {
                   disabled={currentStatus === "Running"}
                 />
 
-                <button
-                  onClick={handleSend}
-                  disabled={currentStatus === "Running"}
-                >
-                  {currentStatus === "Running" ? "Running..." : "Send"}
-                </button>
+                <div className="composer-actions">
+                  <button
+                    className="send-btn"
+                    onClick={handleSend}
+                    disabled={currentStatus === "Running"}
+                  >
+                    {currentStatus === "Running" ? "Running..." : "Send"}
+                  </button>
+
+                  {currentStatus === "Running" && (
+                    <button
+                      className="cancel-btn"
+                      type="button"
+                      onClick={handleCancelButton}
+                    >
+                      Cancel
+                    </button>
+                  )}
+                </div>
               </div>
             </>
           )}
@@ -1312,14 +1513,11 @@ function App() {
         </div>
 
         <div className="history-list">
-          {!activeSessionId ? (
+          {!activeSession ? (
             <p className="empty-history">No active saved session yet.</p>
           ) : (
             <div className="history-item static-item">
-              <strong>
-                {sessions.find((item) => item.id === activeSessionId)?.title ||
-                  "Current session"}
-              </strong>
+              <strong>{activeSession.title || "Current session"}</strong>
 
               <p>
                 {detectedCodes.length > 0
@@ -1333,7 +1531,7 @@ function App() {
 
               <button
                 className="delete-session-btn"
-                onClick={() => deleteSession(activeSessionId)}
+                onClick={() => deleteSession(activeSession.id)}
               >
                 Delete Session
               </button>
