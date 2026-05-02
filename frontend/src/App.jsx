@@ -66,6 +66,26 @@ function clearSupabaseBrowserState() {
   });
 }
 
+function isPasswordRecoveryUrl() {
+  const urlText = `${window.location.hash || ""} ${window.location.search || ""}`.toLowerCase();
+  return (
+    urlText.includes("type=recovery") ||
+    urlText.includes("password_recovery") ||
+    urlText.includes("recovery_token")
+  );
+}
+
+function clearPasswordRecoveryUrl() {
+  try {
+    window.history.replaceState(
+      {},
+      document.title,
+      `${window.location.origin}${window.location.pathname}`
+    );
+  } catch {
+  }
+}
+
 function withTimeout(promise, timeoutMs = 2000) {
   let timeoutId;
 
@@ -292,8 +312,6 @@ function LoginScreen({ onAuthReady }) {
         if (error) throw error;
 
         if (data.user) {
-          // Do not overwrite an existing saved display name during normal login.
-          // Only update the profile here if the user explicitly typed a display name.
           if (displayName.trim()) {
             await upsertProfile(data.user, cleanName);
           }
@@ -557,31 +575,64 @@ function SettingsPanel({
     }
 
     setIsChangingPassword(true);
-    setStatus("");
+    setStatus("Updating password...");
+
+    let softTimeoutId = null;
 
     try {
-      const sessionResult = await withTimeout(supabase.auth.getSession(), 12000);
-      const activeSession = sessionResult?.data?.session;
+      const updatePromise = supabase.auth.updateUser({ password: cleanPassword });
 
-      if (sessionResult?.error) throw sessionResult.error;
-      if (!activeSession) {
-        throw new Error(
-          "No active Supabase auth session found. Please log out, log in again, then change the password."
-        );
+      const result = await Promise.race([
+        updatePromise.then((response) => ({ type: "resolved", response })),
+        new Promise((resolve) => {
+          softTimeoutId = window.setTimeout(
+            () => resolve({ type: "soft_timeout" }),
+            12000
+          );
+        }),
+      ]);
+
+      if (softTimeoutId) {
+        window.clearTimeout(softTimeoutId);
+        softTimeoutId = null;
       }
 
-      const { error } = await withTimeout(
-        supabase.auth.updateUser({ password: cleanPassword }),
-        20000
-      );
-      if (error) throw error;
+      if (result.type === "resolved") {
+        const { error } = result.response || {};
+        if (error) throw error;
+
+        setNewPassword("");
+        setStatus(
+          recoveryMode
+            ? "Password updated. Returning to debugger..."
+            : "Password updated successfully."
+        );
+        onPasswordUpdated?.({ mode: recoveryMode ? "recovery" : "settings", optimistic: false });
+        return;
+      }
+
+      // Supabase can successfully update the password but keep the browser
+      // auth promise pending because of a GoTrue/local-storage lock. Do not
+      // show an "Operation timed out" failure if the request was already sent.
+      updatePromise
+        .then(({ error }) => {
+          if (error) console.warn("Password update finished late with error:", error.message);
+        })
+        .catch((lateError) => {
+          console.warn("Password update finished late with error:", lateError?.message || lateError);
+        });
 
       setNewPassword("");
-      setStatus("Password updated successfully.");
-      onPasswordUpdated?.();
+      setStatus(
+        recoveryMode
+          ? "Password update request completed. Returning to debugger..."
+          : "Password update request completed. You may continue using the debugger."
+      );
+      onPasswordUpdated?.({ mode: recoveryMode ? "recovery" : "settings", optimistic: true });
     } catch (error) {
-      setStatus(error.message || "Failed to update password.");
+      setStatus(error?.message || "Failed to update password.");
     } finally {
+      if (softTimeoutId) window.clearTimeout(softTimeoutId);
       setIsChangingPassword(false);
     }
   }
@@ -590,13 +641,19 @@ function SettingsPanel({
     <div className="settings-card">
       <div className="settings-header">
         <div>
-          <h3>Settings</h3>
-          <p>Manage profile and password for this prototype account.</p>
+          <h3>{recoveryMode ? "Password Recovery" : "Settings"}</h3>
+          <p>
+            {recoveryMode
+              ? "Set a new password before returning to the debugger."
+              : "Manage profile and password for this prototype account."}
+          </p>
         </div>
 
-        <button type="button" className="close-settings-btn" onClick={onClose}>
-          Close
-        </button>
+        {!recoveryMode && (
+          <button type="button" className="close-settings-btn" onClick={onClose}>
+            Close
+          </button>
+        )}
       </div>
 
       {recoveryMode && (
@@ -604,21 +661,22 @@ function SettingsPanel({
           Password recovery mode is active. Enter a new password below.
         </p>
       )}
+      {!recoveryMode && (
+        <form className="settings-section" onSubmit={handleUpdateName}>
+          <label>
+            Display Name
+            <input
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              placeholder="Display name"
+            />
+          </label>
 
-      <form className="settings-section" onSubmit={handleUpdateName}>
-        <label>
-          Display Name
-          <input
-            value={name}
-            onChange={(event) => setName(event.target.value)}
-            placeholder="Display name"
-          />
-        </label>
-
-        <button type="submit" disabled={isSavingName}>
-          {isSavingName ? "Saving..." : "Update Name"}
-        </button>
-      </form>
+          <button type="submit" disabled={isSavingName}>
+            {isSavingName ? "Saving..." : "Update Name"}
+          </button>
+        </form>
+      )}
 
       <form className="settings-section" onSubmit={handleChangePassword}>
         <label>
@@ -703,6 +761,13 @@ function App() {
 
     async function loadAuthSession() {
       try {
+        const recoveryUrlActive = isPasswordRecoveryUrl();
+
+        if (recoveryUrlActive) {
+          setPasswordRecoveryMode(true);
+          setShowSettings(true);
+          setUiError("Password recovery mode active. Set a new password before using chat history.");
+        }
         timeoutId = window.setTimeout(() => {
           if (!mounted) return;
           timedOut = true;
@@ -726,7 +791,15 @@ function App() {
 
         if (currentUser) {
           await loadProfile(currentUser.id, currentUser.email, currentUser);
-          await loadSessions(currentUser.id);
+
+          if (recoveryUrlActive) {
+            setSessions([]);
+            setActiveSession(null);
+            activeSessionIdRef.current = null;
+            setMessages(initialMessages);
+          } else {
+            await loadSessions(currentUser.id);
+          }
         }
       } catch {
         if (!mounted || timedOut) return;
@@ -745,39 +818,52 @@ function App() {
 
     loadAuthSession();
 
-    const { data } = supabase.auth.onAuthStateChange((event, session) => {
-      const currentUser = session?.user || null;
-      setUser(currentUser);
+    const { data } = supabase.auth.onAuthStateChange(async (event, session) => {
+      try {
+        const currentUser = session?.user || null;
+        const recoveryEvent = event === "PASSWORD_RECOVERY" || isPasswordRecoveryUrl();
+        setUser(currentUser);
 
-      if (event === "PASSWORD_RECOVERY") {
-        setPasswordRecoveryMode(true);
-        setShowSettings(true);
-        setUiError("Password recovery mode active. Enter your new password in Settings.");
-      }
+        if (recoveryEvent) {
+          setPasswordRecoveryMode(true);
+          setShowSettings(true);
+          setUiError("Password recovery mode active. Set a new password before using chat history.");
+        }
 
-      if (!currentUser) {
+        if (currentUser) {
+          await loadProfile(currentUser.id, currentUser.email, currentUser);
+
+          if (recoveryEvent) {
+            setSessions([]);
+            setActiveSession(null);
+            activeSessionIdRef.current = null;
+            setMessages(initialMessages);
+            setInput("");
+            setAttachments([]);
+            setCurrentStatus("Ready");
+            setLastTrace(null);
+            setRunningStage("idle");
+          } else {
+            await loadSessions(currentUser.id);
+          }
+        } else {
+          setDisplayName("");
+          setSessions([]);
+          setActiveSessionId(null);
+          activeSessionIdRef.current = null;
+          setMessages(initialMessages);
+        }
+      } catch {
+        clearSupabaseBrowserState();
+        setUser(null);
         setDisplayName("");
         setSessions([]);
         setActiveSessionId(null);
         activeSessionIdRef.current = null;
         setMessages(initialMessages);
+      } finally {
         setAuthLoading(false);
-        return;
       }
-
-      // Important: do not await Supabase queries directly inside onAuthStateChange.
-      // In development this can hold the Supabase auth storage lock and cause
-      // updateUser/password changes to time out. Defer profile/history loading.
-      window.setTimeout(async () => {
-        try {
-          await loadProfile(currentUser.id, currentUser.email, currentUser);
-          await loadSessions(currentUser.id);
-        } catch (error) {
-          console.warn("Deferred auth-state reload failed:", error?.message || error);
-        } finally {
-          if (mounted) setAuthLoading(false);
-        }
-      }, 0);
     });
 
     return () => {
@@ -791,6 +877,7 @@ function App() {
 
   const activeSession = sessions.find((session) => session.id === activeSessionId);
   const statusClass = statusClassMap[currentStatus] || "status-gray";
+  const isRecoveryLocked = passwordRecoveryMode;
 
   const traceStatus = (() => {
     const route = lastTrace?.route || lastTrace?.adk_trace?.app_name || "";
@@ -1024,6 +1111,12 @@ function App() {
   async function loadSessionMessages(sessionId) {
     if (!user || !sessionId) return;
 
+    if (passwordRecoveryMode) {
+      setShowSettings(true);
+      setUiError("Finish password recovery first. Chat history is locked until the password is updated.");
+      return;
+    }
+
     activeAbortControllerRef.current?.abort();
     activeAbortControllerRef.current = null;
 
@@ -1096,6 +1189,11 @@ function App() {
     const filesForRequest = [...attachments];
 
     if (currentStatus === "Running") return;
+    if (passwordRecoveryMode) {
+      setUiError("Finish password recovery first. Chat history and new chats are locked until the password is updated.");
+      setShowSettings(true);
+      return;
+    }
     if (!trimmedMessage && filesForRequest.length === 0) return;
 
     if (!user) {
@@ -1346,6 +1444,12 @@ function App() {
   }
 
   function handleNewChat() {
+    if (passwordRecoveryMode) {
+      setShowSettings(true);
+      setUiError("Finish password recovery first. New chat is locked until the password is updated.");
+      return;
+    }
+
     if (activeAbortControllerRef.current && currentStatus === "Running") {
       handleCancelButton();
     }
@@ -1445,10 +1549,15 @@ function App() {
           </div>
 
           <nav className="nav">
-            <button type="button" className="nav-active" onClick={handleNewChat}>
+            <button type="button" className={isRecoveryLocked ? "" : "nav-active"} onClick={handleNewChat} disabled={isRecoveryLocked}>
               New Chat
             </button>
-            <button type="button" onClick={handleOpenSettings}>
+            <button
+              type="button"
+              onClick={handleOpenSettings}
+              disabled={isRecoveryLocked}
+              className={isRecoveryLocked ? "nav-active" : ""}
+            >
               Settings
             </button>
           </nav>
@@ -1456,11 +1565,13 @@ function App() {
           <section className="sidebar-history">
             <div className="sidebar-history-header">
               <h2>History</h2>
-              <span>{sessions.length}</span>
+              <span>{isRecoveryLocked ? 0 : sessions.length}</span>
             </div>
 
             <div className="sidebar-history-list">
-              {sessions.length === 0 ? (
+              {isRecoveryLocked ? (
+                <p>History is locked until the password is updated.</p>
+              ) : sessions.length === 0 ? (
                 <p>No saved chats yet.</p>
               ) : (
                 sessions.map((session) => (
@@ -1511,19 +1622,50 @@ function App() {
 
         {uiError && <div className="ui-error">{uiError}</div>}
 
-        {showSettings ? (
+        {showSettings || isRecoveryLocked ? (
           <SettingsPanel
             user={user}
             displayName={displayName}
             recoveryMode={passwordRecoveryMode}
             onClose={() => {
+              if (passwordRecoveryMode) {
+                setShowSettings(true);
+                setUiError("Password recovery mode is active. Set a new password before leaving Settings.");
+                return;
+              }
+
               setShowSettings(false);
-              setPasswordRecoveryMode(false);
             }}
             onProfileUpdated={(newName) => setDisplayName(newName)}
-            onPasswordUpdated={() => {
-              setPasswordRecoveryMode(false);
-              setUiError("Password updated successfully.");
+            onPasswordUpdated={(result = {}) => {
+              const updatedFromRecovery = passwordRecoveryMode || result?.mode === "recovery";
+
+              setCurrentStatus("Ready");
+              setLastTrace(null);
+              setRunningStage("idle");
+              setUiError("");
+
+              if (updatedFromRecovery) {
+                clearPasswordRecoveryUrl();
+                setPasswordRecoveryMode(false);
+                setShowSettings(false);
+                setMessages(initialMessages);
+                setActiveSession(null);
+              }
+
+              if (user?.id) {
+                fireAndForget(loadSessions(user.id), "reload sessions after password update");
+              }
+
+              if (result?.optimistic) {
+                window.setTimeout(() => {
+                  setUiError(
+                    updatedFromRecovery
+                      ? "Password update completed. You can now continue using the debugger."
+                      : "Password update request completed. You can continue using the debugger."
+                  );
+                }, 250);
+              }
             }}
           />
         ) : (
@@ -1558,7 +1700,7 @@ function App() {
         )}
 
         <footer className="composer-wrap">
-          {!showSettings && (
+          {!showSettings && !isRecoveryLocked && (
             <>
               <div className="file-strip">
                 <label className="attach-chip">
@@ -1622,19 +1764,32 @@ function App() {
 
       <aside className="history-panel">
         <div className="history-header">
-          <h3>Current Session</h3>
-          <span className={`mini-status ${statusClass}`}>{currentStatus}</span>
+          <h3>{isRecoveryLocked ? "Password Recovery" : "Current Session"}</h3>
+          <span className={`mini-status ${isRecoveryLocked ? "status-orange" : statusClass}`}>
+            {isRecoveryLocked ? "Locked" : currentStatus}
+          </span>
         </div>
 
-        <button
-          type="button"
-          className="trace-panel-button"
-          onClick={() => setShowAdvancedTrace((value) => !value)}
-        >
-          {showAdvancedTrace ? "Hide Advanced Trace" : "Show Advanced Trace"}
-        </button>
+        {!isRecoveryLocked && (
+          <button
+            type="button"
+            className="trace-panel-button"
+            onClick={() => setShowAdvancedTrace((value) => !value)}
+          >
+            {showAdvancedTrace ? "Hide Advanced Trace" : "Show Advanced Trace"}
+          </button>
+        )}
 
-        {showAdvancedTrace && (
+        {isRecoveryLocked && (
+          <section className="trace-panel">
+            <div className="trace-row">
+              <strong>Access Locked</strong>
+              <span>Update your password before opening chat history or starting a new chat.</span>
+            </div>
+          </section>
+        )}
+
+        {!isRecoveryLocked && showAdvancedTrace && (
           <section className="trace-panel">
             <TraceStatus
               label="Backend API"

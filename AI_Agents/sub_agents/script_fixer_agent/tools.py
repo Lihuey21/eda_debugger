@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import re
 from typing import Any, Dict, Optional
 
 
@@ -274,6 +275,199 @@ def _get_issue_type_and_fix_pattern(outer: Dict[str, Any]) -> tuple[str, Optiona
     return issue_type or "diagnosed_issue", recommended_fix_pattern
 
 
+
+# ------------------------------------------------------------
+# RAG constraint helpers
+# ------------------------------------------------------------
+
+def _flatten_text(value: Any, max_depth: int = 8) -> str:
+    """Convert nested payload fragments into searchable constraint text."""
+    pieces: list[str] = []
+
+    def visit(obj: Any, depth: int) -> None:
+        if depth > max_depth:
+            return
+
+        obj = _maybe_parse_string(obj)
+
+        if isinstance(obj, str):
+            if obj.strip():
+                pieces.append(obj.strip())
+            return
+
+        if isinstance(obj, dict):
+            for key, child in obj.items():
+                key_text = str(key).lower()
+                if key_text in {
+                    "retrieved_notes",
+                    "recommended_fix_strategy",
+                    "fix_pattern",
+                    "fix_patterns",
+                    "notes",
+                    "rule",
+                    "rules",
+                    "constraint",
+                    "constraints",
+                    "documentation",
+                    "message",
+                    "root_cause",
+                }:
+                    visit(child, depth + 1)
+                elif isinstance(child, (dict, list, tuple)):
+                    visit(child, depth + 1)
+            return
+
+        if isinstance(obj, (list, tuple, set)):
+            for item in obj:
+                visit(item, depth + 1)
+
+    visit(value, 0)
+    return "\n".join(dict.fromkeys(pieces))
+
+
+def _extract_constraint_text(outer: Dict[str, Any]) -> str:
+    evidence = _extract_diagnosis_evidence(outer)
+    summary = _extract_evidence_summary(outer)
+
+    parts = [
+        _flatten_text(summary),
+        _flatten_text(evidence),
+        _flatten_text(outer.get("diagnosis_result", {})),
+        _flatten_text(outer.get("graph_context", [])),
+    ]
+
+    return "\n".join(part for part in parts if part.strip())
+
+
+def _extract_forbidden_terms(constraint_text: str) -> list[str]:
+    """
+    Data-driven constraint extraction.
+    Example supported RAG note:
+      NEVER use map_size_ok for wildcards.
+      Do not use `abc`.
+      Must not use "xyz".
+    """
+    if not constraint_text:
+        return []
+
+    patterns = [
+        r"\bNEVER\s+use\s+[`'\"]?([A-Za-z0-9_./:+\-]+)",
+        r"\b[Dd]o\s+not\s+use\s+[`'\"]?([A-Za-z0-9_./:+\-]+)",
+        r"\b[Mm]ust\s+not\s+use\s+[`'\"]?([A-Za-z0-9_./:+\-]+)",
+        r"\b[Ff]orbidden\s+to\s+use\s+[`'\"]?([A-Za-z0-9_./:+\-]+)",
+    ]
+
+    terms: list[str] = []
+    for pattern in patterns:
+        for match in re.finditer(pattern, constraint_text):
+            term = match.group(1).strip().strip("`'\".,;:)")
+            if term and term.lower() not in {"the", "this", "it", "a", "an"}:
+                terms.append(term)
+
+    return sorted(set(terms), key=str.lower)
+
+
+def _contains_forbidden_term(tcl: str, forbidden_terms: list[str]) -> Optional[str]:
+    lowered = (tcl or "").lower()
+    for term in forbidden_terms:
+        if term.lower() in lowered:
+            return term
+    return None
+
+
+def _line_matches_command(line: str, command: str) -> bool:
+    return line.strip() == command.strip()
+
+
+def _find_command_index(lines: list[str], command: str, start: int = 0) -> int:
+    target = command.strip()
+    for index in range(start, len(lines)):
+        stripped = lines[index].strip()
+        if stripped == target or stripped.startswith(target + " "):
+            return index
+    return -1
+
+
+def _apply_move_constraints(original_tcl: str, constraint_text: str) -> Optional[str]:
+    """
+    Generic RAG-driven move-rule executor.
+
+    It does not know any specific EDA error code. It only obeys retrieved notes
+    that explicitly say: move `COMMAND` after `A` and before `B`.
+    """
+    if not original_tcl or not constraint_text:
+        return None
+
+    move_patterns = [
+        r"[Mm]ove\s+`([^`]+)`.*?\bafter\s+`([^`]+)`.*?\bbefore\s+`([^`]+)`",
+        r"[Mm]ove\s+(.+?)\s+after\s+([^\n.]+?)\s+and\s+before\s+([^\n.]+)",
+    ]
+
+    for pattern in move_patterns:
+        match = re.search(pattern, constraint_text, flags=re.DOTALL)
+        if not match:
+            continue
+
+        command = match.group(1).strip().strip("`'\". ")
+        after_cmd = match.group(2).strip().strip("`'\". ")
+        before_cmd = match.group(3).strip().strip("`'\". ")
+
+        if not command or not after_cmd or not before_cmd:
+            continue
+
+        lines = original_tcl.splitlines()
+        remaining = [line for line in lines if not _line_matches_command(line, command)]
+
+        after_index = _find_command_index(remaining, after_cmd)
+        if after_index == -1:
+            continue
+
+        before_index = _find_command_index(remaining, before_cmd, start=after_index + 1)
+        if before_index == -1:
+            continue
+
+        insert_at = before_index
+        if insert_at > 0 and remaining[insert_at - 1].strip():
+            remaining.insert(insert_at, "")
+            insert_at += 1
+
+        remaining.insert(insert_at, command)
+
+        if insert_at + 1 < len(remaining) and remaining[insert_at + 1].strip():
+            remaining.insert(insert_at + 1, "")
+
+        return "\n".join(remaining).strip()
+
+    return None
+
+
+def _constraint_failure_message(forbidden_term: str, fix_status: str) -> str:
+    return (
+        "**Explanation**\n\n"
+        "The generated Tcl patch was rejected because it violated the retrieved "
+        "knowledge-graph constraints. The diagnostic evidence forbids using "
+        f"`{forbidden_term}`, but the proposed patch still contained it.\n\n"
+        "This is not safe to package as an automatic Tcl fix. The engineer should "
+        "review the retrieved fix strategy and regenerate the patch so that it obeys "
+        "all MUST/NEVER and before/after ordering constraints.\n\n"
+        "**Summary of Issues**\n\n"
+        f"1. Proposed patch contained forbidden term: `{forbidden_term}`.\n"
+        "2. Patch did not fully obey retrieved RAG constraints.\n\n"
+        "**Recommendations**\n\n"
+        "1. Follow the retrieved fix strategy exactly.\n"
+        "2. Do not introduce values or commands that the retrieved notes forbid.\n"
+        "3. If retrieved notes specify command ordering, relocate the original command instead of replacing it.\n\n"
+        "**Example Manual Fix Template**\n\n"
+        "TCL TEMPLATE:\n"
+        "```tcl\n"
+        "# Review the retrieved fix strategy and apply only the allowed command movement/rewrite.\n"
+        "# Do not use terms that retrieved_notes marks as forbidden.\n"
+        "```\n\n"
+        "**Fix Status**\n\n"
+        f"{fix_status or 'Manual Fix Required'}"
+    )
+
+
 def _minimal_missing_content_message(fix_status: str) -> str:
     return (
         "**Explanation**\n\n"
@@ -314,6 +508,9 @@ def attempt_tcl_patch(
     patched_tcl_clean = _clean_tcl_code(patched_tcl) if patched_tcl and patched_tcl.strip() else ""
     manual_text = manual_response.strip() if manual_response and manual_response.strip() else ""
     explanation_text = explanation.strip() if explanation and explanation.strip() else ""
+
+    constraint_text = _extract_constraint_text(outer)
+    forbidden_terms = _extract_forbidden_terms(constraint_text)
 
     print("\n================ FIXER TOOL DEBUG ================")
     print(f"DEBUG: fixability = {fixability}")
@@ -396,8 +593,42 @@ def attempt_tcl_patch(
 
     # ------------------------------------------------------------
     # Patched Tcl path for auto_fixable / partial_fixable.
+    # Enforce retrieved RAG constraints generically.
     # ------------------------------------------------------------
     if patched_tcl_clean:
+        changes = [
+            "The Tcl script was generated by the Fixer Agent using the diagnostic payload."
+        ]
+
+    
+        rag_moved_tcl = _apply_move_constraints(original_tcl, constraint_text)
+        if rag_moved_tcl:
+            patched_tcl_clean = rag_moved_tcl
+            changes.append(
+                "The Tcl command ordering was constrained using the retrieved knowledge-graph move rule."
+            )
+
+        forbidden = _contains_forbidden_term(patched_tcl_clean, forbidden_terms)
+        if forbidden:
+            result = {
+                "fix_status": "manual_fix_required",
+                "issue_type": issue_type,
+                "patched_tcl": None,
+                "applied_fix_pattern": recommended_fix_pattern,
+                "changes_applied": [],
+                "explanation": _constraint_failure_message(
+                    forbidden_term=forbidden,
+                    fix_status="Manual Fix Required",
+                ),
+                "fixability": fixability,
+                "fixability_reason": fixability_reason,
+                "constraint_violation": {
+                    "forbidden_term": forbidden,
+                    "forbidden_terms": forbidden_terms,
+                },
+            }
+            return json.dumps(result, indent=2)
+
         result = {
             "fix_status": fix_status or (
                 "partial_fix_applied" if fixability == "partial_fixable" else "auto_fixed"
@@ -405,15 +636,14 @@ def attempt_tcl_patch(
             "issue_type": issue_type,
             "patched_tcl": patched_tcl_clean,
             "applied_fix_pattern": recommended_fix_pattern or "llm_generated_fix",
-            "changes_applied": [
-                "The Tcl script was generated by the Fixer Agent using the diagnostic payload."
-            ],
+            "changes_applied": changes,
             "explanation": (
                 explanation_text
                 or _minimal_missing_content_message(fix_status or "Auto Fixed")
             ),
             "fixability": fixability,
             "fixability_reason": fixability_reason,
+            "forbidden_terms_checked": forbidden_terms,
         }
 
         return json.dumps(result, indent=2)
@@ -437,7 +667,6 @@ def attempt_tcl_patch(
 
     # ------------------------------------------------------------
     # Final packaging fallback.
-    # No diagnostic explanation is generated here.
     # ------------------------------------------------------------
     result = {
         "fix_status": fix_status or "manual_fix_required",

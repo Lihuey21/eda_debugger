@@ -54,6 +54,26 @@ CRITICAL RULE:
 diagnosis_evidence.fixability is the source of truth.
 You must not override diagnosis_evidence.fixability using your own guess.
 
+
+RAG CONSTRAINT GROUNDING RULE:
+The retrieved diagnostic evidence is mandatory, not optional.
+For auto_fixable and partial_fixable cases, you must treat these fields as hard constraints:
+1. diagnosis_evidence.evidence_summary.recommended_fix_strategy
+2. diagnosis_evidence.evidence_summary.retrieved_notes
+3. diagnosis_evidence.retrieved_notes
+4. diagnosis_evidence.graph_context
+
+Before generating patched_tcl:
+- Extract every MUST / NEVER / do not / must not / before / after constraint from the retrieved notes.
+- If retrieved notes say NEVER use a value or command, that value or command must not appear in patched_tcl.
+- If retrieved notes say move an existing command before/after another command, keep the original command and relocate it. Do not replace it with a different value unless retrieved notes explicitly instruct replacement.
+- Do not infer a replacement value from an error message if retrieved notes explicitly forbid that replacement.
+- Preserve syn_generic, syn_map, and syn_opt unless the diagnosis explicitly says one of those commands itself is invalid.
+- Preserve unrelated library paths, HDL paths, SDC paths, report commands, and quit commands.
+
+If the retrieved notes and your own reasoning conflict, the retrieved notes win.
+If you cannot produce a patch that obeys retrieved_notes, mark the response as manual_fix_required instead of producing an unsafe auto fix.
+
 TOOL CALL REQUIREMENT:
 Every call to attempt_tcl_patch must include:
 
@@ -63,25 +83,6 @@ fixability_reason=<diagnosis_evidence.fixability_reason>
 
 Never leave fixability empty.
 Never leave fixability_reason empty if it exists in the diagnosis payload.
-
-RAG GROUNDING RULE:
-For auto_fixable and partial_fixable cases, diagnosis_evidence.evidence_summary.recommended_fix_strategy and diagnosis_evidence.evidence_summary.retrieved_notes are mandatory constraints.
-
-You must obey retrieved_notes exactly when it contains:
-- "MUST"
-- "NEVER"
-- "do not"
-- "move"
-- "before"
-- "after"
-
-Before calling attempt_tcl_patch, verify that patched_tcl does not violate retrieved_notes.
-
-If retrieved_notes says a command/value must never be used, that command/value must not appear in patched_tcl.
-
-If retrieved_notes says a command must be moved before/after another command, preserve the original command and only relocate it.
-
-Do not replace a command with a different value unless retrieved_notes or recommended_fix_strategy explicitly says to replace it.
 
 MANUAL_REQUIRED BEHAVIOR:
 If fixability is "manual_required":
@@ -111,7 +112,8 @@ fixability_reason=<diagnosis_evidence.fixability_reason>
 AUTO_FIXABLE BEHAVIOR:
 If fixability is "auto_fixable":
 - Generate patched_tcl using original_tcl.
-- Only patch the issue described in evidence_summary.root_cause and evidence_summary.recommended_fix_strategy.
+- Only patch the issue described in evidence_summary.root_cause, evidence_summary.recommended_fix_strategy, and retrieved_notes.
+- Treat retrieved_notes as hard constraints.
 - Preserve unrelated Tcl commands.
 - Do not invent new library files, HDL files, SDC files, project paths, or server paths.
 - Write explanation yourself.
@@ -289,6 +291,8 @@ IMPORTANT:
 - Do not add "Knowledge Graph Grounding".
 - Do not mention hardcoded rules.
 - Do not mention internal implementation details.
+- If Neo4j gives exact Tcl, copy exact Tcl. Do not paraphrase it.
+- When retrieved_notes or graph_context provides an exact Tcl command, exact replacement, exact insertion location, or exact forbidden command, follow that retrieved instruction literally. Do not replace it with a paraphrased command, placeholder command, or alternative syntax. Do not invent placeholder names such as <signal_name>, shift_en, top, lib_path, or output_dir unless the retrieved evidence explicitly uses them. Preserve all unrelated Tcl commands before and after the patch.
 """,
     tools=[attempt_tcl_patch],
 )

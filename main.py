@@ -84,6 +84,13 @@ IMPORTANT_LOG_KEYWORDS = [
     "CDFG-",
     "VLOG-",
     "SYN-",
+    "SYNTH-",
+    "DFT-",
+    "TIM-",
+    "CFM-",
+    "PHYS-",
+    "DPOPT-",
+    "CWD-",
     "read_libs",
     "read_hdl",
     "elaborate",
@@ -92,6 +99,23 @@ IMPORTANT_LOG_KEYWORDS = [
     "syn_map",
     "syn_opt",
     "set_db",
+    "report_timing",
+    "report_power",
+    "report_area",
+    "report_qor",
+    "write_hdl",
+    "write_sdc",
+    "write_sdf",
+    "write_db",
+    "set_db dft_scan_style",
+    "set_db dft_prefix",
+    "define_shift_enable",
+    "define_scan_chain",
+    "connect_scan_chains",
+    "check_dft_rules",
+    "write_dft_atpg",
+    "write_scandef",
+    "report_scan_chains",
 ]
 
 TCL_HINTS = [
@@ -105,6 +129,16 @@ TCL_HINTS = [
     "syn_opt",
     "report_timing",
     "write_hdl",
+    "write_sdc",
+    "write_sdf",
+    "write_db",
+    "write_dft_atpg",
+    "write_scandef",
+    "report_scan_chains",
+    "check_dft_rules",
+    "define_shift_enable",
+    "define_scan_chain",
+    "connect_scan_chains",
     "quit",
 ]
 
@@ -120,6 +154,18 @@ LOG_HINTS = [
     "file-",
     "elab-",
     "cdfg-",
+    "vlog-",
+    "syn-",
+    "synth-",
+    "dft-",
+    "tim-",
+    "cfm-",
+    "phys-",
+    "dpopt-",
+    "cwd-",
+    "connect_scan_chains",
+    "define_shift_enable",
+    "check_dft_rules",
     "encountered problems processing file",
     "finished executable startup",
     "checking out license",
@@ -239,7 +285,7 @@ def filter_log_text(
 
 
 def extract_error_codes(text: str) -> List[str]:
-    pattern = r"\b(?:TUI|LBR|FILE|ELAB|CDFG|VLOG|SYN)-\d+\b"
+    pattern = r"\b(?:TUI|LBR|FILE|ELAB|CDFG|VLOG|SYN|SYNTH|DFT|TIM|CFM|PHYS|DPOPT|CWD)-\d+\b"
     codes = sorted(set(re.findall(pattern, text or "", flags=re.IGNORECASE)))
     return [code.upper() for code in codes]
 
@@ -419,11 +465,13 @@ async def run_adk(
     preferred_final_authors: Optional[List[str]] = None,
 ) -> tuple[str, dict]:
     """
-    Run one isolated ADK session and return a user-facing answer.
+    Run one isolated ADK session and return the best user-facing answer.
 
-    This function contains no issue-specific EDA fix rules. For multi-agent runs,
-    it only prefers the final text emitted by the expected final-response agent,
-    if that author exists. Otherwise, it falls back to the last text event.
+    For pipeline runs, the final answer should come from script_fixer_agent.
+    ADK may also emit intermediate diagnosis/tool JSON, so this function keeps
+    all text events with authors and prefers the requested final-response author
+    when available. If the preferred author is absent, it safely falls back to
+    the last text event.
     """
     started = time.perf_counter()
 
@@ -512,6 +560,7 @@ async def run_adk(
     }
 
     return answer, trace
+
 
 # ------------------------------------------------------------
 # Chat endpoint
