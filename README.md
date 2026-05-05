@@ -245,16 +245,6 @@ VITE_SUPABASE_ANON_KEY
 
 The frontend API URL should point to the deployed backend URL.
 
-## 9. Limitations
 
-This project is a prototype and is not intended to replace professional EDA signoff or manual engineering review. The current system supports selected Genus Tcl/log debugging patterns and relies on the quality of the uploaded log, Tcl script and Neo4j knowledge graph entries.
-
-Known limitations:
-
-- Limited dataset size.
-- Dependent on available Genus logs and controlled test cases.
-- Neo4j knowledge graph must be populated with relevant error-code rules.
-- Long raw logs require filtering or compaction.
-- Some fixes remain manual because external files, libraries, paths, licenses or permissions cannot be verified by the agent.
 
 
