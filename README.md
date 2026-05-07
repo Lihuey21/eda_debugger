@@ -1,10 +1,10 @@
-# Agentic EDA Script Debugger
+# EDA Script Debugger Agentic AI System
 
 ## 1. Project Overview
 
 Agentic EDA Script Debugger is a prototype AI-assisted debugging system for Cadence Genus Tcl synthesis flows. The system accepts a Tcl script and a corresponding Genus execution log, identifies the primary root cause of a failed run, retrieves relevant debugging knowledge from a Neo4j knowledge graph and returns either a patched Tcl script or a manual-fix recommendation.
 
-The project is built as an agentic AI pipeline using Google ADK. It is intended as a Final Year Project prototype and focuses on Tcl/log debugging for Genus synthesis flows, including selected DFT-related cases.
+The project is built as an agentic AI pipeline using Google ADK. It is intended as a Final Year Project prototype and focuses on Tcl/log debugging for Genus synthesis flows.
 
 ## 2. Main Features
 
@@ -13,7 +13,7 @@ The project is built as an agentic AI pipeline using Google ADK. It is intended 
 - Detect whether uploaded files form a complete Tcl + log debugging pair.
 - Preprocess long Genus logs before sending them into the agent pipeline.
 - Retrieve tool-specific guidance from a Neo4j knowledge graph.
-- Classify debugging cases into No Fix Needed, Manual Fix Required, Auto Fixed and Partial Fix Applied.
+- Classify debugging cases into No Fix Needed, Manual Fix Required and Auto Fixed
 - Generate patched Tcl scripts for safe auto-fixable cases.
 - Provide manual recommendations for external environment or file-system issues.
 - Frontend chat interface with session history, settings and advanced trace panel.
@@ -75,7 +75,6 @@ The high-level pipeline is:
 User Tcl + log
 → Backend file preprocessing
 → ADK pipeline
-→ Script Analyzer Agent
 → Error Diagnosis Agent
 → Neo4j knowledge retrieval
 → Script Fixer Agent
